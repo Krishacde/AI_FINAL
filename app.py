@@ -943,7 +943,9 @@ import threading
 import time
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # Reconfigure stdout/stderr for Windows UTF-8 console output
 if sys.platform == "win32":
@@ -958,18 +960,19 @@ import traceback
 import uvicorn
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
+from agents.simulated_payment_agent import SimulatedPaymentAgent
+from agents.autonomous_trip_booking_agent import AutonomousTripBookingAgent
 from backend import RequestCancelled, TripRequest, run_travel_agent, run_trip, run_discovery, replanning_agent
 from tools.flight_tool import API_KEY as AVIATIONSTACK_API_KEY
-from tools.razorpay_payment import (
-    create_hotel_order,
-    verify_hotel_payment,
-    fetch_payment,
-)
+from services.payment_service import PaymentError, PaymentService
+from services.sandbox_quotes import create_sandbox_cab_quote
+from services.result_cache import result_cache
+from services.trip_store import trip_store
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -1004,9 +1007,20 @@ app.mount(
     name="static"
 )
 
+REACT_DIST_DIR = BASE_DIR / "frontend" / "dist"
+REACT_INDEX = REACT_DIST_DIR / "index.html"
+REACT_ASSETS_DIR = REACT_DIST_DIR / "assets"
+if REACT_ASSETS_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(REACT_ASSETS_DIR)), name="react-assets")
+
 templates = Jinja2Templates(
     directory=str(BASE_DIR / "templates")
 )
+
+_simulated_payment_agent: SimulatedPaymentAgent | None = None
+_simulated_payment_agent_lock = threading.Lock()
+_autonomous_booking_agent: AutonomousTripBookingAgent | None = None
+_autonomous_booking_agent_lock = threading.Lock()
 
 
 def rate_limit_response(request: Request, bucket: str) -> JSONResponse | None:
@@ -1047,33 +1061,19 @@ class TravelRequest(BaseModel):
 
 class GuidedTripRequest(TripRequest):
     thread_id: str | None = None
+    request_id: str | None = Field(default=None, min_length=8, max_length=100)
 
 
 class ProviderSelectionRequest(BaseModel):
     trip_id: str
     provider_type: str
     option: dict
+    trip_context: dict = {}
 
 
-class HotelPaymentOrderRequest(BaseModel):
-    trip_id: str
-    hotel: dict
-    travelers: int = Field(default=1, ge=1, le=50)
-
-
-class HotelPaymentVerifyRequest(BaseModel):
-    trip_id: str
-    hotel: dict
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
-
-
-class HotelBookingConfirmRequest(BaseModel):
-    trip_id: str
-    hotel: dict
-    razorpay_order_id: str
-    razorpay_payment_id: str
+class DemoWalletTopUpRequest(BaseModel):
+    amount_minor: StrictInt = Field(gt=0, le=100_000_000)
+    idempotency_key: str = Field(min_length=1, max_length=160)
 
 
 class DiscoveryQueryRequest(BaseModel):
@@ -1099,10 +1099,13 @@ class ReplanPayload(BaseModel):
     change_text: str
     itinerary: list[dict] = []
     trip_context: dict = {}
+    expected_version: int | None = None
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
+    if REACT_INDEX.is_file():
+        return FileResponse(REACT_INDEX, media_type="text/html")
     return templates.TemplateResponse(
         request=request,
         name="index.html",
@@ -1112,11 +1115,169 @@ async def home(request: Request):
 
 @app.get("/discover", response_class=HTMLResponse)
 async def discover_page(request: Request):
+    if REACT_INDEX.is_file():
+        return FileResponse(REACT_INDEX, media_type="text/html")
     return templates.TemplateResponse(
         request=request,
         name="discover.html",
         context={}
     )
+
+
+@app.get("/payment-demo")
+async def payment_demo_page():
+    return JSONResponse(
+        status_code=410,
+        content={"success": False, "error": "Interactive checkout has been retired; use the autonomous simulated booking flow."},
+    )
+
+
+@app.post("/api/payments/hotel/agent/start")
+@app.post("/api/payments/hotel/agent/complete")
+@app.post("/api/payments/hotel/agent/continue/{session_id}")
+@app.post("/api/payments/hotel/agent/stop/{session_id}")
+@app.post("/api/payments/hotel/agent/retry/{session_id}")
+@app.post("/api/payments/hotel/order")
+@app.post("/api/payments/hotel/verify")
+async def retired_real_payment_routes(session_id: str | None = None):
+    return JSONResponse(
+        status_code=410,
+        content={"success": False, "error": "Real payment and interactive checkout endpoints are disabled. No money is charged."},
+    )
+
+
+def get_simulated_payment_agent() -> SimulatedPaymentAgent:
+    global _simulated_payment_agent
+    if _simulated_payment_agent is None:
+        with _simulated_payment_agent_lock:
+            if _simulated_payment_agent is None:
+                _simulated_payment_agent = SimulatedPaymentAgent(PaymentService())
+    return _simulated_payment_agent
+
+
+def get_autonomous_booking_agent() -> AutonomousTripBookingAgent:
+    global _autonomous_booking_agent
+    if _autonomous_booking_agent is None:
+        with _autonomous_booking_agent_lock:
+            if _autonomous_booking_agent is None:
+                _autonomous_booking_agent = AutonomousTripBookingAgent(get_simulated_payment_agent())
+    return _autonomous_booking_agent
+
+
+def attach_booking_to_trip(trip: dict, booking: dict, trip_request: dict | None = None) -> None:
+    trip["demo_booking"] = booking
+    hotel = booking.get("selected_hotel")
+    if not booking.get("success") or not hotel:
+        return
+    start_date = (trip_request or trip.get("request") or {}).get("start_date")
+    amount = booking.get("amount_minor", 0) / 100
+    quote = hotel.get("quote") or {}
+    entry = {
+        "date": quote.get("check_in") or start_date,
+        "start_time": "14:00",
+        "end_time": "15:00",
+        "title": f"Sandbox accommodation confirmed: {hotel.get('name', 'Accommodation')}",
+        "location": hotel.get("area") or trip.get("selected_destination"),
+        "description": (
+            f"Sandbox reservation {booking.get('booking_id')} · quote {quote.get('quote_id', 'unavailable')} · "
+            f"{quote.get('nights', 1)} night(s), {quote.get('rooms', 1)} room(s), {quote.get('travelers', 1)} guest(s) · "
+            f"₹{amount:,.0f} sandbox total. No supplier reservation was placed."
+        ),
+        "estimated_cost": amount,
+        "cost_status": "SANDBOX_CONFIRMED",
+        "reason": "Autonomous sandbox booking",
+        "booking_id": booking.get("booking_id"),
+        "document_id": (booking.get("payment") or {}).get("documents", {}).get("hotel_voucher", {}).get("document_id"),
+    }
+    activities = trip.setdefault("itinerary", [])
+    activities[:] = [item for item in activities if item.get("reason") != "Autonomous sandbox booking"]
+    activities.insert(0, entry)
+
+
+def existing_booking_view(payment: dict, hotels: list[dict]) -> dict | None:
+    item = next((row for row in payment.get("items", []) if row.get("category") == "hotel"), None)
+    if not item:
+        return None
+    metadata = item.get("metadata") or {}
+    hotel = next((row for row in hotels if row.get("name") == item.get("name")), None)
+    hotel = dict(hotel or {"name": item["name"]})
+    hotel["price_num"] = item["amount_minor"] // 100
+    hotel["quote"] = {
+        **metadata,
+        "amount_minor": item["amount_minor"],
+        "currency": payment.get("currency", "INR"),
+        "provider": "TripMate sandbox inventory",
+        "quote_type": metadata.get("quote_type", "SANDBOX"),
+    }
+    return {
+        "success": True,
+        "status": payment["status"],
+        "booking_status": payment["booking_status"],
+        "booking_id": payment["booking_id"],
+        "payment_id": payment["payment_id"],
+        "transaction_id": payment.get("transaction_id"),
+        "amount_minor": payment["amount_minor"],
+        "money_mode": "SIMULATED_ONLY",
+        "selected_hotel": hotel,
+        "selection_reason": "Existing sandbox reservation preserved; no second charge was created.",
+        "progress": [{"step": "Existing reservation reused during itinerary update.", "status": "complete"}],
+        "payment": payment,
+    }
+
+
+@app.post("/api/demo/bookings")
+@app.post("/api/sandbox/bookings")
+def create_autonomous_demo_booking():
+    return JSONResponse(
+        status_code=410,
+        content={"success": False, "error": "Booking runs automatically with trip planning. Start a trip to let the agents select an eligible sandbox quote, pay, and issue booking documents."},
+    )
+
+
+@app.get("/api/demo/wallet")
+@app.get("/api/sandbox/wallet")
+def get_demo_wallet():
+    try:
+        return get_simulated_payment_agent().service.get_wallet_balance()
+    except Exception:
+        logger.exception("Could not read simulated wallet balance.")
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "The simulated wallet is temporarily unavailable."},
+        )
+
+
+@app.post("/api/demo/wallet/topups")
+@app.post("/api/sandbox/wallet/topups")
+def top_up_demo_wallet(request: Request, request_data: DemoWalletTopUpRequest):
+    limited = rate_limit_response(request, "wallet-topup")
+    if limited:
+        return limited
+    try:
+        wallet = get_simulated_payment_agent().service.add_simulated_funds(
+            request_data.amount_minor, request_data.idempotency_key
+        )
+        return {"success": True, "money_mode": "SIMULATED_ONLY", "wallet": wallet}
+    except PaymentError as exc:
+        return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+    except Exception:
+        logger.exception("Could not add simulated funds to the demo wallet.")
+        return JSONResponse(status_code=503, content={"success": False, "error": "The simulated wallet is temporarily unavailable."})
+
+
+@app.get("/api/demo/payments/{payment_id}")
+@app.get("/api/sandbox/payments/{payment_id}")
+def get_demo_payment(payment_id: str):
+    try:
+        return get_simulated_payment_agent().service.get_payment_status(payment_id)
+    except PaymentError as exc:
+        return JSONResponse(status_code=404, content={"success": False, "error": str(exc)})
+    except Exception:
+        logger.exception("Could not read simulated payment %s.", payment_id)
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "error": "The simulated payment service is temporarily unavailable."},
+        )
 
 
 @app.post("/api/travel")
@@ -1158,6 +1319,93 @@ async def travel_planner(request: Request, request_data: TravelRequest):
         )
 
 
+@app.get("/api/trips")
+async def list_saved_trips():
+    """List durable trip summaries; payment status is never read from Redis."""
+    return {"success": True, "trips": trip_store.list_trips()}
+
+
+@app.get("/api/trips/{trip_id}")
+async def get_saved_trip(trip_id: str):
+    trip = trip_store.get_trip(trip_id)
+    if trip is None:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
+    return {"success": True, "trip": trip}
+
+
+@app.get("/api/trips/{trip_id}/messages")
+async def get_trip_messages(trip_id: str):
+    if trip_store.get_trip(trip_id) is None:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
+    return {"success": True, "messages": trip_store.get_messages(trip_id)}
+
+
+@app.get("/api/trips/{trip_id}/versions")
+async def get_trip_versions(trip_id: str):
+    if trip_store.get_trip(trip_id) is None:
+        return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
+    return {"success": True, "versions": trip_store.get_versions(trip_id)}
+
+
+@app.patch("/api/trips/{trip_id}")
+async def rename_saved_trip(trip_id: str, request_data: dict[str, Any]):
+    try:
+        if "itinerary_items" in request_data:
+            trip = trip_store.get_trip(trip_id)
+            if trip is None:
+                return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
+            if not isinstance(request_data["itinerary_items"], list):
+                return JSONResponse(status_code=422, content={"success": False, "error": "itinerary_items must be a list."})
+            trip["itinerary_items"] = request_data["itinerary_items"]
+            trip_store.save_trip(trip, change_summary=str(request_data.get("change_summary") or "Trip plan updated"))
+        if "name" in request_data and not trip_store.rename_trip(trip_id, str(request_data["name"])):
+            return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
+        return {"success": True, "trip": trip_store.get_trip(trip_id)}
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
+
+
+@app.delete("/api/trips/{trip_id}")
+async def delete_saved_trip(trip_id: str):
+    if not trip_store.delete_trip(trip_id):
+        return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
+    return {"success": True, "trip_id": trip_id}
+
+
+def persist_trip_booking(trip_id: str, provider_type: str, option: dict[str, Any], booking: dict[str, Any]) -> dict[str, Any] | None:
+    """Persist confirmed booking references alongside the trip after ledger success."""
+    payment = booking.get("payment") or {}
+    if not (booking.get("success") and payment.get("status") == "SUCCESS" and payment.get("booking_status") == "CONFIRMED"):
+        return None
+    trip = trip_store.get_trip(trip_id)
+    if trip is None:
+        return None
+    records = trip.get("sandbox_bookings") or []
+    payment_id = payment.get("payment_id") or booking.get("payment_id")
+    if payment_id and any((row.get("payment") or {}).get("payment_id") == payment_id for row in records):
+        return trip
+    records.append(booking)
+    trip["sandbox_bookings"] = records
+    activities = list(trip.get("itinerary_items") or trip.get("itinerary") or [])
+    item_name = str(option.get("name") or option.get("airline") or "Selected service")
+    amount = float(payment.get("amount_minor", 0)) / 100
+    if provider_type == "hotel":
+        activities = [row for row in activities if not row.get("is_hotel_entry")]
+        activities.append({"date": (option.get("quote") or {}).get("check_in") or (trip.get("request") or {}).get("start_date"),
+                           "start_time": "14:00", "end_time": "15:00", "title": f"Sandbox stay confirmed: {item_name}",
+                           "location": option.get("area") or trip.get("selected_destination"), "status": "SANDBOX_CONFIRMED",
+                           "cost": amount, "is_hotel_entry": True, "booking_id": booking.get("booking_id")})
+    elif provider_type == "cab":
+        activities = [row for row in activities if not row.get("is_cab_entry")]
+        activities.append({"date": (option.get("quote") or {}).get("travel_date") or (trip.get("request") or {}).get("start_date"),
+                           "start_time": "12:00", "end_time": "13:00", "title": f"Sandbox transfer confirmed: {item_name}",
+                           "location": option.get("route") or trip.get("selected_destination"), "status": "SANDBOX_CONFIRMED",
+                           "cost": amount, "is_cab_entry": True, "booking_id": booking.get("booking_id")})
+    trip["itinerary_items"] = activities
+    trip_store.save_trip(trip, change_summary=f"Sandbox {provider_type} booking confirmed")
+    return trip_store.get_trip(trip_id)
+
+
 @app.post("/api/trips/{trip_id}/selections")
 async def select_provider(
     trip_id: str,
@@ -1166,8 +1414,7 @@ async def select_provider(
     """
     Provider selection router.
 
-    Hotel selection intentionally does NOT confirm a booking.
-    It tells the frontend that payment is the next action.
+    A traveler selects the service; the payment agent validates and books it.
     """
 
     if trip_id != request_data.trip_id:
@@ -1195,21 +1442,32 @@ async def select_provider(
     )
 
     if request_data.provider_type == "hotel":
-        return {
-            "success": True,
-            "trip_id": trip_id,
-            "selection": {
-                "type": "hotel",
-                "name": option_name,
-                "option": request_data.option,
-            },
-            "next_action": "PAYMENT_REQUIRED",
-            "payment_required": True,
-            "message": (
-                f"{option_name} selected. "
-                "Payment is required to confirm accommodation."
-            ),
-        }
+        context = request_data.trip_context
+        try:
+            trip_request = TripRequest.model_validate({
+                **context,
+                "destination": context.get("destination") or request_data.option.get("destination"),
+                "origin": context.get("origin") or "Unknown origin",
+                "currency": "INR",
+            })
+            booking = await asyncio.to_thread(
+                get_autonomous_booking_agent().run,
+                {"trip_id": trip_id, "hotels": [request_data.option]},
+                trip_request,
+                0,
+            )
+        except Exception as exc:
+            logger.exception("Traveler-selected hotel sandbox booking failed.")
+            return JSONResponse(status_code=400, content={"success": False, "error": str(exc)})
+        saved_trip = persist_trip_booking(trip_id, "hotel", request_data.option, booking)
+        return JSONResponse(
+            status_code=200 if booking.get("success") else 402,
+            content={"success": bool(booking.get("success")), "trip_id": trip_id,
+                     "selection": {"type": "hotel", "name": option_name},
+                     "sandbox_booking": booking,
+                     "trip": saved_trip,
+                     "message": "The payment agent completed the sandbox booking." if booking.get("success") else booking.get("error", "Booking failed.")},
+        )
 
     detail = (
         request_data.option.get("flight_number")
@@ -1222,6 +1480,40 @@ async def select_provider(
         "flight": "flight",
         "cab": "transport",
     }[request_data.provider_type]
+
+    if request_data.provider_type == "cab":
+        context = request_data.trip_context
+        cab_quote = request_data.option.get("quote") or {}
+        route = str(request_data.option.get("route") or context.get("destination") or "Local transfer")
+        travel_date = str(context.get("start_date") or "")
+        try:
+            authoritative_quote = create_sandbox_cab_quote(name=str(option_name), route=route, travel_date=travel_date)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"success": False, "error": str(exc)})
+        try:
+            expires_at = datetime.fromisoformat(str(cab_quote.get("expires_at")))
+            quote_is_current = expires_at.tzinfo is not None and expires_at > datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            quote_is_current = False
+        if (not quote_is_current or cab_quote.get("quote_id") != authoritative_quote["quote_id"]
+                or cab_quote.get("amount_minor") != authoritative_quote["amount_minor"]):
+            return JSONResponse(status_code=409, content={"success": False, "error": "Transport quote is stale or invalid. Refresh the plan and select again."})
+        cab_result = await asyncio.to_thread(
+            get_simulated_payment_agent().run,
+            trip_id,
+            [{"category": "cab", "name": str(option_name)[:160], "amount_minor": authoritative_quote["amount_minor"],
+              "available": True, "metadata": {"route": str(request_data.option.get("route") or context.get("destination") or "Local transfer"),
+              "travel_date": travel_date, "quote_id": authoritative_quote["quote_id"], "quote_type": "SANDBOX"}}],
+        )
+        saved_trip = persist_trip_booking(trip_id, "cab", request_data.option, cab_result)
+        return JSONResponse(
+            status_code=200 if cab_result.get("success") else 402,
+            content={"success": bool(cab_result.get("success")), "trip_id": trip_id,
+                     "selection": {"type": "cab", "name": option_name},
+                     "sandbox_booking": cab_result,
+                     "trip": saved_trip,
+                     "message": "The payment agent completed the sandbox transport booking." if cab_result.get("success") else cab_result.get("error", "Booking failed.")},
+        )
 
     return {
         "success": True,
@@ -1246,287 +1538,6 @@ async def select_provider(
     }
 
 
-@app.post("/api/payments/hotel/order")
-async def create_hotel_payment_order(
-    request_data: HotelPaymentOrderRequest,
-):
-    """
-    Payment Agent:
-    Creates a Razorpay Test Mode order for accommodation.
-    """
-
-    try:
-        hotel = request_data.hotel
-
-        hotel_name = (
-            hotel.get("name")
-            or hotel.get("hotel_name")
-            or hotel.get("title")
-            or "Selected Hotel"
-        )
-
-        price = (
-            hotel.get("total_num")
-            or hotel.get("total_price")
-            or hotel.get("price_num")
-            or hotel.get("price")
-        )
-
-        if price is None:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "error": "Hotel price is missing.",
-                },
-            )
-
-        if isinstance(price, str):
-            cleaned = (
-                price.replace("₹", "")
-                .replace(",", "")
-                .replace("INR", "")
-                .strip()
-            )
-            try:
-                price = float(cleaned)
-            except ValueError:
-                return JSONResponse(
-                    status_code=400,
-                    content={
-                        "success": False,
-                        "error": f"Invalid hotel price: {price}",
-                    },
-                )
-
-        amount_inr = float(price)
-
-        if amount_inr <= 0:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "error": "Hotel price must be greater than zero.",
-                },
-            )
-
-        order = create_hotel_order(
-            hotel_name=hotel_name,
-            amount_inr=amount_inr,
-            trip_id=request_data.trip_id,
-            travelers=request_data.travelers,
-        )
-
-        logger.info(
-            "PAYMENT AGENT | hotel order created | trip=%s | order=%s | amount=%s",
-            request_data.trip_id,
-            order["id"],
-            order["amount"],
-        )
-
-        return {
-            "success": True,
-            "payment_status": "ORDER_CREATED",
-            "agent": "PaymentAgent",
-            "order": order,
-        }
-
-    except Exception as e:
-        logger.exception(
-            "Hotel payment order creation failed: %s",
-            e,
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "error": str(e),
-            },
-        )
-
-
-@app.post("/api/payments/hotel/verify")
-async def verify_hotel_payment_api(
-    request_data: HotelPaymentVerifyRequest,
-):
-    """
-    Deterministic Payment Verification Node.
-
-    The LLM never decides whether payment succeeded.
-    Razorpay signature + captured payment status are authoritative.
-    """
-
-    try:
-        valid_signature = verify_hotel_payment(
-            razorpay_order_id=request_data.razorpay_order_id,
-            razorpay_payment_id=request_data.razorpay_payment_id,
-            razorpay_signature=request_data.razorpay_signature,
-        )
-
-        if not valid_signature:
-            logger.warning(
-                "PAYMENT VERIFICATION FAILED | trip=%s | order=%s",
-                request_data.trip_id,
-                request_data.razorpay_order_id,
-            )
-
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "payment_status": "VERIFICATION_FAILED",
-                    "verified": False,
-                    "error": "Invalid Razorpay payment signature.",
-                },
-            )
-
-        payment = fetch_payment(
-            request_data.razorpay_payment_id
-        )
-
-        payment_status = payment.get("status")
-
-        if payment_status != "captured":
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "payment_status": payment_status,
-                    "verified": False,
-                    "error": (
-                        "Payment signature is valid, "
-                        "but payment is not captured."
-                    ),
-                },
-            )
-
-        logger.info(
-            "PAYMENT VERIFIED | trip=%s | payment=%s | status=%s",
-            request_data.trip_id,
-            request_data.razorpay_payment_id,
-            payment_status,
-        )
-
-        return {
-            "success": True,
-            "payment_status": "PAID",
-            "verified": True,
-            "agent": "PaymentVerificationNode",
-            "trip_id": request_data.trip_id,
-            "payment": {
-                "payment_id": request_data.razorpay_payment_id,
-                "order_id": request_data.razorpay_order_id,
-                "status": payment_status,
-                "amount": payment.get("amount"),
-                "currency": payment.get("currency"),
-                "method": payment.get("method"),
-            },
-        }
-
-    except Exception as e:
-        logger.exception(
-            "Hotel payment verification failed: %s",
-            e,
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "payment_status": "VERIFICATION_ERROR",
-                "verified": False,
-                "error": str(e),
-            },
-        )
-
-
-@app.post("/api/trips/{trip_id}/accommodation/confirm")
-async def confirm_accommodation_booking(
-    trip_id: str,
-    request_data: HotelBookingConfirmRequest,
-):
-    """
-    Accommodation Booking Agent.
-
-    Runs only after the Payment Verification Node has confirmed
-    a captured Razorpay payment.
-    """
-
-    if trip_id != request_data.trip_id:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "error": "Trip ID mismatch.",
-            },
-        )
-
-    try:
-        hotel = request_data.hotel
-
-        hotel_name = (
-            hotel.get("name")
-            or hotel.get("hotel_name")
-            or hotel.get("title")
-            or "Selected Hotel"
-        )
-
-        booking_id = f"HTL-{uuid.uuid4().hex[:10].upper()}"
-
-        booking = {
-            "booking_id": booking_id,
-            "booking_type": "accommodation",
-            "status": "CONFIRMED",
-            "hotel": hotel_name,
-            "hotel_details": hotel,
-            "trip_id": trip_id,
-            "payment": {
-                "status": "PAID",
-                "razorpay_order_id": request_data.razorpay_order_id,
-                "razorpay_payment_id": request_data.razorpay_payment_id,
-            },
-        }
-
-        logger.info(
-            "BOOKING AGENT | accommodation confirmed | trip=%s | booking=%s",
-            trip_id,
-            booking_id,
-        )
-
-        return {
-            "success": True,
-            "agent": "AccommodationBookingAgent",
-            "booking": booking,
-            "itinerary_update": {
-                "type": "accommodation",
-                "title": f"Hotel confirmed: {hotel_name}",
-                "description": (
-                    f"{hotel_name} has been confirmed "
-                    "after successful payment."
-                ),
-                "status": "CONFIRMED",
-            },
-            "message": (
-                f"{hotel_name} confirmed successfully."
-            ),
-        }
-
-    except Exception as e:
-        logger.exception(
-            "Accommodation confirmation failed: %s",
-            e,
-        )
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "error": str(e),
-            },
-        )
-
-
 @app.post("/api/trips")
 async def create_trip(request: Request, request_data: GuidedTripRequest):
     """Run the evidence-first LangGraph planner with structured user choices."""
@@ -1534,9 +1545,37 @@ async def create_trip(request: Request, request_data: GuidedTripRequest):
     if limited:
         return limited
     try:
-        payload = request_data.model_dump(mode="json", exclude={"thread_id"})
+        payload = request_data.model_dump(mode="json", exclude={"thread_id", "request_id"})
         logger.info("request=trip_create status=started thread_id=%s destination=%s", request_data.thread_id or "new", payload.get("destination"))
-        trip = await run_cancellable(request, run_trip, payload, request_data.thread_id)
+        trip = await run_cancellable(
+            request,
+            run_trip,
+            payload,
+            request_data.thread_id,
+            trip_id=request_data.request_id or str(uuid.uuid4()),
+        )
+        # The traveler selects a priced service first. Payment starts only after
+        # an explicit selection through /api/trips/{trip_id}/selections.
+        trip["demo_booking"] = None
+        destination = str(trip.get("selected_destination") or payload.get("destination") or "destination")
+        route = f"Local transfer · {destination}"
+        trip["cabs"] = []
+        for cab_name, vehicle, duration in [
+            ("Local Sedan Transfer", "AC sedan · up to 3 passengers", "Point-to-point local service"),
+            ("Local SUV Transfer", "AC SUV · up to 5 passengers", "Point-to-point local service"),
+            ("Local Van Transfer", "AC van · up to 8 passengers", "Point-to-point local service"),
+        ]:
+            quote = create_sandbox_cab_quote(name=cab_name, route=route, travel_date=str(payload["start_date"]))
+            trip["cabs"].append({"name": cab_name, "route": route, "vehicle": vehicle, "duration": duration,
+                                 "price_num": quote["amount_minor"] // 100, "price": f"₹{quote['amount_minor'] // 100:,} sandbox total",
+                                 "quote": quote, "status": "SANDBOX_QUOTE"})
+        trip["request"] = payload
+        persistence = trip_store.save_trip(trip, change_summary="Initial itinerary generated")
+        trip["current_version"] = persistence["version"]
+        trip["created_at"] = persistence["created_at"]
+        trip["updated_at"] = persistence["updated_at"]
+        trip_store.add_message(trip["trip_id"], "user", f"Plan a trip to {destination} from {payload.get('origin')}.")
+        trip_store.add_message(trip["trip_id"], "assistant", "Initial itinerary generated by the travel-planning workflow.")
         return JSONResponse(content={"success": True, "trip": trip})
     except RequestCancelled:
         return JSONResponse(status_code=499, content={"success": False, "cancelled": True, "error": "Trip research cancelled."})
@@ -1588,11 +1627,37 @@ async def replan_itinerary(request: Request, request_data: ReplanPayload):
         return limited
     try:
         logger.info("request=trip_replan status=started trip_id=%s change=%s", request_data.trip_id, request_data.change_text)
-        result = replanning_agent(
+        stored_trip = trip_store.get_trip(request_data.trip_id)
+        if stored_trip and request_data.expected_version is not None and request_data.expected_version != stored_trip.get("current_version"):
+            return JSONResponse(status_code=409, content={"success": False, "error": "This itinerary has changed since it was loaded. Refresh the saved trip before applying another edit."})
+        current_items = stored_trip.get("itinerary_items") or stored_trip.get("itinerary") or [] if stored_trip else request_data.itinerary
+        agent_itinerary = [item for item in current_items if isinstance(item, dict) and not (item.get("is_flight_entry") or item.get("is_hotel_entry") or item.get("is_cab_entry"))]
+        saved_request = (stored_trip or {}).get("request") or {}
+        agent_context = {
+            **request_data.trip_context,
+            **{key: value for key, value in saved_request.items() if value is not None},
+            "destination": stored_trip.get("selected_destination") or saved_request.get("destination") if stored_trip else request_data.trip_context.get("destination"),
+        }
+        result = await asyncio.to_thread(
+            replanning_agent,
             change_text=request_data.change_text,
-            current_itinerary=request_data.itinerary,
-            trip_context=request_data.trip_context
+            current_itinerary=agent_itinerary,
+            trip_context=agent_context,
         )
+        if stored_trip and isinstance(result.get("itinerary"), list):
+            old_items = stored_trip.get("itinerary_items") or stored_trip.get("itinerary") or []
+            preserved = [item for item in old_items if isinstance(item, dict) and (item.get("is_flight_entry") or item.get("is_hotel_entry") or item.get("is_cab_entry"))]
+            stored_trip["itinerary_items"] = preserved + result["itinerary"]
+            stored_trip["itinerary"] = result["itinerary"]
+            if result.get("hotel_search_performed"):
+                stored_trip["hotels"] = result.get("updated_hotels") or []
+            version_record = trip_store.save_trip(stored_trip, change_summary=result.get("change_summary") or request_data.change_text)
+            stored_trip["current_version"] = version_record["version"]
+            trip_store.add_message(request_data.trip_id, "user", request_data.change_text)
+            trip_store.add_message(request_data.trip_id, "assistant", result.get("change_summary") or "Itinerary updated by the replanning workflow.")
+            result["trip"] = stored_trip
+        # Replanning changes the itinerary only. It must never choose or buy a
+        # newly suggested hotel; the traveler can select it from refreshed cards.
         return JSONResponse(content={"success": True, **result})
     except Exception as exc:
         logger.exception("request=trip_replan status=failed error=%s", exc)
@@ -1621,6 +1686,7 @@ async def diagnostics():
     return {
         "status": "ok",
         "keys": {name: "configured" if value else "missing" for name, value in keys.items()},
+        "cache": result_cache.status(),
         "notes": {
             "AVIATIONSTACK_API_KEY": "Live flight status lookup.",
             "GEMINI_API_KEY": "Required for multi-agent reasoning, ranking, planning and replanning.",
@@ -1642,6 +1708,17 @@ async def favicon():
     return JSONResponse(content={})
 
 
+@app.get("/{frontend_path:path}", response_class=HTMLResponse)
+async def react_client_route(frontend_path: str):
+    """Serve the React app for client-side routes while keeping unknown APIs 404."""
+    if frontend_path.startswith(("api/", "static/", "assets/")):
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
+    built_index = BASE_DIR / "frontend" / "dist" / "index.html"
+    if built_index.is_file():
+        return FileResponse(built_index)
+    return JSONResponse(status_code=404, content={"detail": "Frontend build not found. Run npm run build."})
+
+
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",
@@ -1649,4 +1726,3 @@ if __name__ == "__main__":
         port=8000,
         reload=False
     )
-

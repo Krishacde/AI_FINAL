@@ -1289,8 +1289,42 @@ let selectedHotel = null;
 let selectedCab = null;
 let tripController = null;
 
-// Tracks hotel payment state locally for the current browser session.
-const hotelPaymentState = new Map();
+function updatePaymentAgentPanel(state) {
+  const panel = document.getElementById("paymentAgentPanel");
+  if (!panel) return;
+  panel.classList.remove("hidden");
+  const statusText = document.getElementById("paymentAgentStatusText");
+  const orderText = document.getElementById("paymentAgentOrderText");
+  const progressEl = document.getElementById("paymentAgentProgress");
+  const documentsEl = document.getElementById("paymentAgentDocuments");
+  if (statusText) statusText.textContent = state?.status || "Preparing sandbox booking";
+  if (orderText) orderText.textContent = state?.booking_id || state?.transaction_id || "—";
+  if (progressEl && Array.isArray(state?.progress)) {
+    progressEl.innerHTML = state.progress
+      .map(event => `<div class="${event.status === "failed" ? "failed" : "complete"}">${esc(event.status === "failed" ? "✗" : "✓")} ${esc(event.step)}</div>`)
+      .join("");
+  }
+  const documents = state?.payment?.documents;
+  const downloadButton = document.getElementById("downloadDemoDocsBtn");
+  if (downloadButton) downloadButton.classList.toggle("hidden", !documents);
+  if (documentsEl && documents) {
+    documentsEl.innerHTML = Object.entries(documents)
+      .filter(([key]) => key !== "label")
+        .map(([key, document]) => {
+          const rows = Object.entries(document)
+            .filter(([field, value]) => field !== "label" && !Array.isArray(value) && value !== null && typeof value !== "object")
+            .map(([field, value]) => {
+              const displayValue = field === "amount_minor"
+                ? `₹${(Number(value) / 100).toLocaleString("en-IN")}`
+                : String(value);
+              return `<div><dt>${esc(field.replaceAll("_", " "))}</dt><dd>${esc(displayValue)}</dd></div>`;
+            })
+            .join("");
+          return `<article class="payment-document"><strong>${esc(key.replaceAll("_", " "))}</strong><dl>${rows}</dl></article>`;
+        })
+        .join("");
+    }
+  }
 
 const $ = id => document.getElementById(id);
 
@@ -1305,6 +1339,116 @@ const esc = x =>
       '"': "&quot;"
     }[c])
   );
+
+async function refreshDemoWallet() {
+  const balance = $("walletBalance");
+  if (!balance) return;
+  try {
+    const response = await fetch("/api/sandbox/wallet");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Wallet unavailable");
+    balance.textContent = `₹${(Number(data.available_minor || 0) / 100).toLocaleString("en-IN")}`;
+  } catch (_) {
+    balance.textContent = "Unavailable";
+  }
+}
+
+async function completeSandboxPurchase(providerType, option) {
+  if (!latestTrip?.trip_id || !option) return;
+  const checkoutWindow = window.open("about:blank", "tripmate-agent-checkout", "width=760,height=850");
+  if (checkoutWindow) {
+    checkoutWindow.document.write("<!doctype html><title>Agent checkout</title><main style='font:16px Arial;max-width:680px;margin:48px auto;padding:24px'><h1>Payment agent checkout</h1><p id='agent-status'>Validating your selected sandbox quote…</p><ol id='agent-steps'><li>Checking selected service, wallet balance, and transaction rules.</li></ol><p>Sandbox only. No real money or supplier reservation.</p></main>");
+    checkoutWindow.document.close();
+  }
+  const panel = document.getElementById("paymentAgentPanel");
+  panel?.classList.remove("hidden");
+  updatePaymentAgentPanel({status: "Payment agent is validating the selected quote…", progress: [
+    {step: "Traveler selection received; payment agent is checking quote, wallet, and policy.", status: "complete"}
+  ]});
+  try {
+    const response = await fetch(`/api/trips/${encodeURIComponent(latestTrip.trip_id)}/selections`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({trip_id: latestTrip.trip_id, provider_type: providerType, option,
+        trip_context: {...(latestTrip.request || {}), destination: latestTrip.selected_destination}})
+    });
+    const data = await response.json();
+    if (!response.ok || !data.success) throw new Error(data.error || data.message || "Sandbox booking failed.");
+    const booking = data.sandbox_booking;
+    latestTrip.demo_booking = booking;
+    latestTrip.sandbox_bookings = [...(latestTrip.sandbox_bookings || []), booking];
+    const item = booking?.payment?.items?.[0];
+    if (!Array.isArray(latestTrip.itinerary_items)) latestTrip.itinerary_items = [];
+    const paidAmount = (item?.amount_minor || 0) / 100;
+    if (providerType === "hotel") {
+      selectedHotel = {...option, total_num: paidAmount};
+      latestTrip.itinerary_items = latestTrip.itinerary_items.filter(activity => !activity.is_hotel_entry);
+      latestTrip.itinerary_items.push({date: latestTrip.request?.start_date, start_time: "14:00", end_time: "15:00",
+        title: `🏨 Confirmed stay: ${option.name}`, location: option.area || latestTrip.selected_destination,
+        description: `Sandbox booking confirmed · ${latestTrip.request?.start_date} to ${latestTrip.request?.end_date}`,
+        reason: "Payment agent booking confirmation", status: "CONFIRMED", cost: paidAmount,
+        cost_text: `₹${paidAmount.toLocaleString("en-IN")}`, is_hotel_entry: true, booking_id: booking.booking_id});
+    }
+    if (providerType === "cab") {
+      selectedCab = {...option, price_num: paidAmount};
+      latestTrip.itinerary_items = latestTrip.itinerary_items.filter(activity => !activity.is_cab_entry);
+      latestTrip.itinerary_items.push({date: latestTrip.request?.start_date, start_time: "12:00", end_time: "13:00",
+        title: `🚗 Confirmed transfer: ${option.name}`, location: option.route || latestTrip.selected_destination,
+        description: `${option.vehicle || "Local transfer"} · sandbox booking confirmed`, reason: "Payment agent booking confirmation",
+        status: "CONFIRMED", cost: paidAmount, cost_text: `₹${paidAmount.toLocaleString("en-IN")}`,
+        is_cab_entry: true, booking_id: booking.booking_id});
+    }
+    updatePaymentAgentPanel({...booking, status: "Sandbox booking confirmed", progress: booking.progress || []});
+    if (checkoutWindow && !checkoutWindow.closed) {
+      const status = checkoutWindow.document.getElementById("agent-status");
+      const steps = checkoutWindow.document.getElementById("agent-steps");
+      if (status) status.textContent = `Payment and ${providerType} booking completed: ${booking.booking_id || booking.payment_id || "confirmed"}.`;
+      if (steps) steps.innerHTML = (booking.progress || []).map(step => `<li>${esc(step.step)}</li>`).join("");
+      checkoutWindow.document.body.insertAdjacentHTML("beforeend", "<p><strong>Confirmed in TripMate sandbox.</strong> Return to the trip plan for the refreshed itinerary and booking PDF.</p>");
+    }
+    await refreshDemoWallet();
+    renderTrip(latestTrip);
+    showToast("Payment agent confirmed the sandbox booking. Itinerary updated.");
+  } catch (error) {
+    if (checkoutWindow && !checkoutWindow.closed) {
+      const status = checkoutWindow.document.getElementById("agent-status");
+      if (status) status.textContent = `Checkout stopped: ${error.message}`;
+    }
+    updatePaymentAgentPanel({status: "Sandbox payment could not be completed", progress: [
+      {step: error.message, status: "failed"}
+    ]});
+    showToast(error.message);
+  }
+}
+
+refreshDemoWallet();
+
+$("walletTopUpBtn")?.addEventListener("click", async () => {
+  const rupees = Number($("walletTopUpAmount")?.value);
+  if (!Number.isSafeInteger(rupees) || rupees < 1 || rupees > 1000000) {
+    showPaymentMessage("Enter a whole rupee amount between ₹1 and ₹1,000,000.", "error");
+    return;
+  }
+  const button = $("walletTopUpBtn");
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/sandbox/wallet/topups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        amount_minor: rupees * 100,
+        idempotency_key: window.crypto?.randomUUID?.() || `topup-${Date.now()}`
+      })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || "Wallet top-up failed.");
+    $("walletBalance").textContent = `₹${(Number(result.wallet.available_minor) / 100).toLocaleString("en-IN")}`;
+    showPaymentMessage("Simulated wallet funds added. No real money was collected.", "success");
+  } catch (error) {
+    showPaymentMessage(error.message || "Wallet top-up failed.", "error");
+  } finally {
+    button.disabled = false;
+  }
+});
 
 
 // =============================================================
@@ -1356,9 +1500,9 @@ $("interests")?.addEventListener("click", event => {
 // HELPERS
 // =============================================================
 
-function section(title, body, badge = "") {
+function section(title, body, badge = "", id = "") {
   return `
-    <section class="dash-section">
+    <section class="dash-section" ${id ? `id="${esc(id)}"` : ""}>
       <div class="dash-section-header">
         <h3>${esc(title)}</h3>
         ${badge ? `<span class="section-tag">${esc(badge)}</span>` : ""}
@@ -1396,8 +1540,9 @@ function buildTripViewModel(payload, response) {
     location: activity.location || dest,
     description: activity.description || "",
     reason: activity.reason || "",
-    status:
-      activity.cost_status === "UNAVAILABLE"
+    status: activity.booking_id
+      ? "SIMULATED"
+      : activity.cost_status === "UNAVAILABLE"
         ? "ESTIMATED"
         : activity.cost_status || "VERIFIED",
     cost: activity.estimated_cost
@@ -1406,56 +1551,11 @@ function buildTripViewModel(payload, response) {
     cost_text: activity.estimated_cost
       ? `₹${Number(activity.estimated_cost).toLocaleString("en-IN")}`
       : "Free / Included",
-    is_custom: false
+    is_custom: false,
+    is_hotel_entry: Boolean(activity.booking_id),
+    booking_id: activity.booking_id,
+    document_id: activity.document_id
   }));
-
-
-  const fallbackFlights = [
-    {
-      airline: "IndiGo / Air India",
-      flight_number: "6E-241 / AI-582",
-      departure: "08:30",
-      arrival: "11:45",
-      stops: "Non-stop (3h 15m)",
-      price: "₹6,800",
-      price_num: 6800,
-      cabin: "7kg Cabin + 15kg Check-in",
-      status: "ESTIMATED"
-    },
-    {
-      airline: "Vistara",
-      flight_number: "UK-819",
-      departure: "14:15",
-      arrival: "17:30",
-      stops: "Non-stop (3h 15m)",
-      price: "₹8,200",
-      price_num: 8200,
-      cabin: "Premium Economy · Meal Included",
-      status: "ESTIMATED"
-    }
-  ];
-
-
-  const fallbackCabs = [
-    {
-      name: "Airport / Station Transfer",
-      route: "Terminal ⇄ Hotel Check-in",
-      duration: "35–45 mins",
-      price: "₹950",
-      price_num: 950,
-      vehicle: "Sedan (AC) with luggage space",
-      status: "ESTIMATED"
-    },
-    {
-      name: "Full-Day Sightseeing Chauffeur",
-      route: "All prime attractions & viewpoint loop",
-      duration: "8 hours / 80 km",
-      price: "₹2,400",
-      price_num: 2400,
-      vehicle: "Dedicated SUV / Sedan with local guide-driver",
-      status: "ESTIMATED"
-    }
-  ];
 
 
   const fallbackInsights = {
@@ -1500,35 +1600,25 @@ function buildTripViewModel(payload, response) {
 
     selected_destination: dest,
 
-    flights:
-      response.flights &&
-      response.flights.length > 0 &&
-      !response.flights[0].message
-        ? response.flights.map((f, i) => ({
-            ...f,
-            price_num:
-              parseCurrencyNum(
-                f.price || f.estimated_cost
-              ) || (6500 + i * 1200)
-          }))
-        : fallbackFlights,
+    flights: (response.flights || [])
+      .filter(f => !f.message && (f.price || f.estimated_cost))
+      .map(f => ({
+        ...f,
+        price_num: parseCurrencyNum(f.price || f.estimated_cost)
+      })),
 
     hotels:
       response.hotels &&
       response.hotels.length > 0
-        ? response.hotels.map((h, i) => ({
+        ? response.hotels.map(h => ({
             ...h,
-
-            total_num:
-              parseCurrencyNum(
-                h.total_price ||
-                h.price_num ||
-                h.price
-              ) || (12000 + i * 3500)
+            total_num: Number.isSafeInteger(Number(h.price_num)) && Number(h.price_num) > 0
+              ? Number(h.price_num)
+              : 0
           }))
         : [],
 
-    cabs: fallbackCabs,
+    cabs: response.cabs || [],
 
     travel_insights:
       response.travel_insights ||
@@ -1662,40 +1752,8 @@ function toggleFlightSelection(index) {
 
 
 // =============================================================
-// HOTEL SELECTION / PAYMENT ENTRY POINT
+// AUTONOMOUS DEMO BOOKING
 // =============================================================
-
-function toggleHotelSelection(index) {
-  if (!latestTrip) return;
-
-  const hotel = latestTrip.hotels[index];
-
-  /*
-   * IMPORTANT:
-   *
-   * Clicking the hotel button does NOT immediately confirm
-   * the hotel.
-   *
-   * It starts:
-   *
-   * User
-   *   ↓
-   * Payment Agent
-   *   ↓
-   * Razorpay
-   *   ↓
-   * Payment Verification
-   *   ↓
-   * Accommodation Booking Agent
-   */
-
-  payForHotel(
-    hotel,
-    latestTrip.trip_id,
-    Number(latestTrip.request?.travelers || 1)
-  );
-}
-
 
 // =============================================================
 // CAB SELECTION
@@ -1703,75 +1761,8 @@ function toggleHotelSelection(index) {
 
 function toggleCabSelection(index) {
   if (!latestTrip) return;
-
   const cab = latestTrip.cabs[index];
-
-  if (
-    selectedCab &&
-    selectedCab.name === cab.name
-  ) {
-    selectedCab = null;
-
-    latestTrip.itinerary_items =
-      latestTrip.itinerary_items.filter(
-        act => !act.is_cab_entry
-      );
-
-    showToast(
-      "Cab transfer removed from itinerary."
-    );
-  } else {
-    selectedCab = cab;
-
-    latestTrip.itinerary_items =
-      latestTrip.itinerary_items.filter(
-        act => !act.is_cab_entry
-      );
-
-    const cabDate =
-      latestTrip.request.start_date;
-
-    latestTrip.itinerary_items.splice(
-      1,
-      0,
-      {
-        date: cabDate,
-        start_time: "12:00",
-        end_time: "13:00",
-
-        title:
-          `🚗 Dedicated Transfer: ${cab.name}`,
-
-        location:
-          cab.route ||
-          latestTrip.selected_destination,
-
-        description:
-          `${cab.vehicle || "AC Sedan"}. Duration: ${cab.duration}`,
-
-        reason:
-          "Local Transport Booking",
-
-        status: "VERIFIED",
-
-        cost:
-          cab.price_num ||
-          parseCurrencyNum(cab.price),
-
-        cost_text:
-          cab.price ||
-          `₹${cab.price_num}`,
-
-        is_cab_entry: true
-      }
-    );
-
-    showToast(
-      `✓ ${cab.name} added to your schedule!`
-    );
-  }
-
-  renderTrip(latestTrip);
+  completeSandboxPurchase("cab", cab);
 }
 
 
@@ -1958,6 +1949,10 @@ function renderItinerary(items) {
 // =============================================================
 
 function renderFlightCards(flights) {
+  if (!flights || !flights.length) {
+    return `<div class="empty-notice">No live flight fares are available from the connected providers. Flight status data does not include purchasable fares or ticket issuance.</div>`;
+  }
+
   return `
     <div class="cards">
 
@@ -2153,46 +2148,16 @@ function renderHotelCards(hotels) {
             selectedHotel &&
             selectedHotel.name === h.name;
 
-          const paymentKey =
-            `${latestTrip?.trip_id || "trip"}:${h.name}`;
-
-          const paymentState =
-            hotelPaymentState.get(
-              paymentKey
-            ) || "NOT_PAID";
-
-          const isPaid =
-            paymentState === "PAID";
-
-
-          const bookingLink =
-            h.booking_url ||
-            `https://www.booking.com/searchresults.html?ss=${encodeURIComponent(
-              h.name +
-              " " +
-              (
-                latestTrip?.selected_destination ||
-                ""
-              )
-            )}`;
-
-
-          const totalAmount =
-            Number(h.total_num) ||
-            parseCurrencyNum(h.total_price) ||
-            Number(h.price_num) ||
-            parseCurrencyNum(h.price) ||
-            0;
-
-
-          const displayPrice =
-            h.total_price ||
-            h.price ||
-            (
-              totalAmount
-                ? `₹${totalAmount.toLocaleString("en-IN")}`
-                : "Price unavailable"
-            );
+          const confirmedHotel = (latestTrip?.sandbox_bookings || [latestTrip?.demo_booking]).filter(Boolean)
+            .find(booking => booking.success && booking.payment?.items?.some(item => item.category === "hotel" && item.name === h.name));
+          const isPaid = Boolean(confirmedHotel);
+          const isAgentChoice = false;
+          const totalAmount = Number(h.total_num) || Number(h.price_num) || 0;
+          const displayPrice = totalAmount > 0
+            ? `₹${totalAmount.toLocaleString("en-IN")}`
+            : "Not eligible";
+          const quote = h.quote || {};
+          const nightlyAmount = Number(quote.nightly_rate_minor || 0) / 100;
 
 
           return `
@@ -2228,7 +2193,7 @@ function renderHotelCards(hotels) {
                 <span class="rating-badge">
                   ${esc(
                     h.rating ||
-                    "4.7 ★"
+                    "Rating unavailable"
                   )}
                 </span>
 
@@ -2238,13 +2203,13 @@ function renderHotelCards(hotels) {
               <div class="card-section">
 
                 <span class="card-label">
-                  Verified Amenities:
+                  Reported property details:
                 </span>
 
                 <p class="card-text">
                   ${esc(
                     h.amenities ||
-                    "Free Breakfast · Wi-Fi · AC · Daily Housekeeping"
+                    "No property details were returned by the research sources."
                   )}
                 </p>
 
@@ -2260,27 +2225,15 @@ function renderHotelCards(hotels) {
                   </span>
 
                   <small>
-                    ${
-                      h.nightly_price
-                        ? `(${esc(h.nightly_price)})`
-                        : "total stay"
-                    }
+                    ${totalAmount > 0
+                      ? `₹${nightlyAmount.toLocaleString("en-IN")} per night · ${esc(quote.nights || 0)} night(s) · ${esc(quote.rooms || 0)} room(s) · sandbox quote`
+                      : esc(h.price_note || "Outside sandbox payment limit")}
                   </small>
 
                 </div>
 
 
                 <div class="hotel-btns-group">
-
-                  <a
-                    href="${esc(bookingLink)}"
-                    target="_blank"
-                    rel="noreferrer"
-                    class="hotel-view-link"
-                  >
-                    Book / View ↗
-                  </a>
-
 
                   ${
                     isPaid
@@ -2290,23 +2243,10 @@ function renderHotelCards(hotels) {
                           type="button"
                           disabled
                         >
-                          ✓ Paid & Confirmed
+                          ✓ Sandbox reservation recorded
                         </button>
                       `
-                      : `
-                        <button
-                          class="primary"
-                          type="button"
-                          onclick="toggleHotelSelection(${i})"
-                          ${
-                            totalAmount <= 0
-                              ? "disabled"
-                              : ""
-                          }
-                        >
-                          💳 Pay ₹${totalAmount.toLocaleString("en-IN")}
-                        </button>
-                      `
+                    : `<button class="primary" type="button" onclick="completeSandboxPurchase('hotel', latestTrip.hotels[${i}])">${isPaid ? "Booked" : "Select & let payment agent book"}</button>`
                   }
 
                 </div>
@@ -2328,6 +2268,10 @@ function renderHotelCards(hotels) {
 // =============================================================
 
 function renderCabCards(cabs) {
+  if (!cabs || !cabs.length) {
+    return `<div class="empty-notice">No live transport quotes are available from a connected provider.</div>`;
+  }
+
   return `
     <div class="cards">
 
@@ -2337,6 +2281,9 @@ function renderCabCards(cabs) {
           const isChosen =
             selectedCab &&
             selectedCab.name === c.name;
+          const isPaid = (latestTrip?.sandbox_bookings || []).some(booking =>
+            booking.success && booking.payment?.items?.some(item => item.category === "cab" && item.name === c.name)
+          );
 
           return `
             <article
@@ -2401,25 +2348,22 @@ function renderCabCards(cabs) {
                   </span>
 
                   <small>
-                    fixed rate
+                    sandbox quote · payment runs after selection
                   </small>
 
                 </div>
 
 
                 <button
-                  class="primary ${
-                    isChosen
-                      ? "added-btn"
-                      : ""
-                  }"
+                  class="primary ${isPaid ? "added-btn" : ""}"
                   type="button"
+                  ${isPaid ? "disabled" : ""}
                   onclick="toggleCabSelection(${i})"
                 >
                   ${
-                    isChosen
-                      ? "✓ In Itinerary"
-                      : "+ Add to Itinerary"
+                    isPaid
+                      ? "✓ Sandbox booking confirmed"
+                      : "Select & let payment agent book"
                   }
                 </button>
 
@@ -2928,7 +2872,8 @@ function renderTrip(trip) {
       renderItinerary(
         trip.itinerary_items
       ),
-      "Interactive Schedule"
+      "Interactive Schedule",
+      "itinerarySection"
     )}
 
     ${section(
@@ -2942,18 +2887,18 @@ function renderTrip(trip) {
     <div id="hotelRecommendationsSection">
 
       ${section(
-        "Accommodation Recommendations (Select to add to Itinerary)",
+        "Accommodation Options (You select; payment agent books)",
         renderHotelCards(
           trip.hotels
         ),
-        "Verified Stays"
+        "Sandbox rates · test inventory"
       )}
 
     </div>
 
 
     ${section(
-      "Local Transport & Cabs (Select to add to Itinerary)",
+      "Local Transport & Cabs (You select; payment agent books)",
       renderCabCards(
         trip.cabs
       ),
@@ -3089,6 +3034,9 @@ $("tripForm").onsubmit =
 
 
     const payload = {
+
+      request_id:
+        window.crypto?.randomUUID?.() || `trip-${Date.now()}-${Math.random().toString(16).slice(2)}`,
 
       planning_mode: "known",
 
@@ -3228,6 +3176,15 @@ $("tripForm").onsubmit =
 
 
       renderTrip(trip);
+      if (trip.demo_booking) {
+        updatePaymentAgentPanel({
+          ...trip.demo_booking,
+          status: trip.demo_booking.success
+            ? "Sandbox reservation recorded"
+            : "Sandbox booking not completed",
+          progress: trip.demo_booking.progress || []
+        });
+      }
 
 
       $("resultSection")
@@ -3414,7 +3371,22 @@ async function handleReplanning(
 
                 pace:
                   latestTrip
-                    .request?.pace
+                    .request?.pace,
+
+                start_date:
+                  latestTrip.request?.start_date,
+
+                end_date:
+                  latestTrip.request?.end_date,
+
+                travelers:
+                  latestTrip.request?.travelers || 1,
+
+                budget:
+                  latestTrip.request?.budget,
+
+                accommodation:
+                  latestTrip.request?.accommodation || "Mid-range hotel"
               }
 
             })
@@ -3444,19 +3416,11 @@ async function handleReplanning(
 
       latestTrip.hotels =
         data.updated_hotels.map(
-          (h, i) => ({
+          h => ({
             ...h,
-
-            total_num:
-              parseCurrencyNum(
-                h.total_price ||
-                h.price_num ||
-                h.price
-              ) ||
-              (
-                12000 +
-                i * 3500
-              )
+            total_num: Number.isSafeInteger(Number(h.price_num)) && Number(h.price_num) > 0
+              ? Number(h.price_num)
+              : 0
           })
         );
 
@@ -3464,7 +3428,7 @@ async function handleReplanning(
       showToast(
         `✓ Found ${
           data.updated_hotels.length
-        } verified hotels matching "${changeText}"!`
+        } researched accommodation options matching "${changeText}"!`
       );
     }
 
@@ -3515,9 +3479,30 @@ async function handleReplanning(
               : "Included",
 
           is_custom:
-            true
+            true,
+
+          is_hotel_entry:
+            Boolean(act.booking_id),
+
+          booking_id:
+            act.booking_id,
+
+          document_id:
+            act.document_id
         })
       );
+
+    if (data.sandbox_booking) {
+      latestTrip.demo_booking = data.sandbox_booking;
+      updatePaymentAgentPanel({
+        ...data.sandbox_booking,
+        status: data.sandbox_booking.success
+          ? "Sandbox reservation recorded"
+          : "Sandbox booking not completed",
+        progress: data.sandbox_booking.progress || []
+      });
+    }
+    if (data.booking_note) showToast(data.booking_note);
 
 
     if (selectedFlight) {
@@ -3621,9 +3606,23 @@ async function handleReplanning(
       updatedActivities;
 
 
-    renderTrip(
-      latestTrip
-    );
+    const itinerarySection = document.getElementById("itinerarySection");
+    if (itinerarySection) {
+      itinerarySection.outerHTML = section(
+        "Day-by-Day Verified Itinerary",
+        renderItinerary(latestTrip.itinerary_items),
+        "Interactive Schedule",
+        "itinerarySection"
+      );
+    }
+    if (data.updated_hotels?.length) {
+      const hotelsSection = document.getElementById("hotelRecommendationsSection");
+      if (hotelsSection) hotelsSection.innerHTML = section(
+        "Accommodation Options (You select; payment agent books)",
+        renderHotelCards(latestTrip.hotels),
+        "Sandbox rates · test inventory"
+      );
+    }
 
 
     showToast(
@@ -3693,622 +3692,9 @@ document
 
 
 // =============================================================
-// RAZORPAY HOTEL PAYMENT
+// SIMULATED AUTONOMOUS BOOKING
 // =============================================================
 
-async function payForHotel(
-  hotel,
-  tripId,
-  travelers = 1
-) {
-
-  const paymentKey =
-    `${tripId}:${hotel?.name || "hotel"}`;
-
-  try {
-
-    if (
-      !hotel ||
-      !tripId
-    ) {
-      throw new Error(
-        "Hotel or trip information is missing."
-      );
-    }
-
-
-    const amount =
-      Number(hotel.total_num) ||
-      parseCurrencyNum(
-        hotel.total_price
-      ) ||
-      Number(hotel.price_num) ||
-      parseCurrencyNum(
-        hotel.price
-      );
-
-
-    if (
-      !amount ||
-      amount <= 0
-    ) {
-      throw new Error(
-        "Valid hotel total price is required."
-      );
-    }
-
-
-    hotelPaymentState.set(
-      paymentKey,
-      "CREATING_ORDER"
-    );
-
-
-    showPaymentMessage(
-      `Payment Agent: creating secure order for ${hotel.name}...`,
-      "success"
-    );
-
-
-    // =========================================================
-    // PAYMENT AGENT -> BACKEND
-    // =========================================================
-
-    const orderResponse =
-      await fetch(
-        "/api/payments/hotel/order",
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
-
-          body:
-            JSON.stringify({
-
-              trip_id:
-                tripId,
-
-              travelers:
-                travelers,
-
-              hotel: {
-                ...hotel,
-
-                total_num:
-                  amount
-              }
-
-            })
-        }
-      );
-
-
-    const orderData =
-      await orderResponse.json();
-
-
-    if (
-      !orderResponse.ok ||
-      !orderData.success ||
-      !orderData.order
-    ) {
-
-      throw new Error(
-        orderData.error ||
-        "Could not create Razorpay payment order."
-      );
-
-    }
-
-
-    const order =
-      orderData.order;
-
-
-    hotelPaymentState.set(
-      paymentKey,
-      "CHECKOUT_OPEN"
-    );
-
-
-    // =========================================================
-    // RAZORPAY CHECKOUT
-    // =========================================================
-
-    if (
-      typeof Razorpay ===
-      "undefined"
-    ) {
-
-      throw new Error(
-        "Razorpay Checkout is not loaded. Add checkout.js before script.js in index.html."
-      );
-
-    }
-
-
-    const options = {
-
-      key:
-        order.key_id,
-
-      amount:
-        order.amount,
-
-      currency:
-        order.currency,
-
-      name:
-        "TripMate AI",
-
-      description:
-        `Accommodation booking - ${order.hotel_name}`,
-
-      order_id:
-        order.id,
-
-      theme: {
-        color:
-          "#3399cc"
-      },
-
-      notes: {
-
-        trip_id:
-          tripId,
-
-        booking_type:
-          "accommodation",
-
-        hotel_name:
-          order.hotel_name
-
-      },
-
-
-      handler:
-        async function (
-          response
-        ) {
-
-          console.log(
-            "[PAYMENT AGENT] Razorpay Checkout completed",
-            response
-          );
-
-
-          await verifyHotelPayment(
-            hotel,
-            tripId,
-            response,
-            paymentKey
-          );
-
-        }
-
-    };
-
-
-    const razorpay =
-      new Razorpay(
-        options
-      );
-
-
-    razorpay.on(
-      "payment.failed",
-      function (
-        response
-      ) {
-
-        hotelPaymentState.set(
-          paymentKey,
-          "FAILED"
-        );
-
-
-        console.error(
-          "[PAYMENT AGENT] Razorpay payment failed",
-          response
-        );
-
-
-        showPaymentMessage(
-          "Payment failed: " +
-          (
-            response.error?.description ||
-            "Unknown payment error"
-          ),
-          "error"
-        );
-
-      }
-    );
-
-
-    razorpay.open();
-
-  } catch (error) {
-
-    console.error(
-      "[PAYMENT AGENT] Order creation failed:",
-      error
-    );
-
-
-    hotelPaymentState.set(
-      paymentKey,
-      "FAILED"
-    );
-
-
-    showPaymentMessage(
-      error.message,
-      "error"
-    );
-
-  }
-
-}
-
-
-// =============================================================
-// PAYMENT VERIFICATION
-// =============================================================
-
-async function verifyHotelPayment(
-  hotel,
-  tripId,
-  razorpayResponse,
-  paymentKey
-) {
-
-  try {
-
-    hotelPaymentState.set(
-      paymentKey,
-      "VERIFYING"
-    );
-
-
-    showPaymentMessage(
-      "Payment Verification Node: verifying payment...",
-      "success"
-    );
-
-
-    // =========================================================
-    // PAYMENT VERIFICATION NODE -> BACKEND
-    // =========================================================
-
-    const response =
-      await fetch(
-        "/api/payments/hotel/verify",
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
-
-          body:
-            JSON.stringify({
-
-              trip_id:
-                tripId,
-
-              hotel:
-                hotel,
-
-              razorpay_order_id:
-                razorpayResponse
-                  .razorpay_order_id,
-
-              razorpay_payment_id:
-                razorpayResponse
-                  .razorpay_payment_id,
-
-              razorpay_signature:
-                razorpayResponse
-                  .razorpay_signature
-
-            })
-        }
-      );
-
-
-    const data =
-      await response.json();
-
-
-    if (
-      !response.ok ||
-      !data.success ||
-      data.payment_status !==
-        "PAID" ||
-      !data.verified
-    ) {
-
-      throw new Error(
-        data.error ||
-        "Payment verification failed."
-      );
-
-    }
-
-
-    console.log(
-      "[PAYMENT VERIFICATION NODE] Payment verified",
-      data
-    );
-
-
-    hotelPaymentState.set(
-      paymentKey,
-      "PAID"
-    );
-
-
-    showPaymentMessage(
-      `✓ Payment successful for ${hotel.name}`,
-      "success"
-    );
-
-
-    // =========================================================
-    // VERIFIED PAYMENT -> BOOKING AGENT
-    // =========================================================
-
-    await confirmAccommodationBooking(
-      hotel,
-      tripId,
-      data.payment,
-      paymentKey
-    );
-
-  } catch (error) {
-
-    hotelPaymentState.set(
-      paymentKey,
-      "FAILED"
-    );
-
-
-    console.error(
-      "[PAYMENT VERIFICATION NODE] Verification failed:",
-      error
-    );
-
-
-    showPaymentMessage(
-      error.message,
-      "error"
-    );
-
-  }
-
-}
-
-
-// =============================================================
-// ACCOMMODATION BOOKING AGENT
-// =============================================================
-
-async function confirmAccommodationBooking(
-  hotel,
-  tripId,
-  payment,
-  paymentKey
-) {
-
-  try {
-
-    const response =
-      await fetch(
-        "/api/trips/" +
-        encodeURIComponent(
-          tripId
-        ) +
-        "/accommodation/confirm",
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json"
-          },
-
-          body:
-            JSON.stringify({
-
-              trip_id:
-                tripId,
-
-              hotel:
-                hotel,
-
-              razorpay_order_id:
-                payment.order_id,
-
-              razorpay_payment_id:
-                payment.payment_id
-
-            })
-        }
-      );
-
-
-    const data =
-      await response.json();
-
-
-    if (
-      !response.ok ||
-      !data.success
-    ) {
-
-      throw new Error(
-        data.error ||
-        "Accommodation confirmation failed."
-      );
-
-    }
-
-
-    console.log(
-      "[ACCOMMODATION BOOKING AGENT] Accommodation confirmed",
-      data
-    );
-
-
-    // =========================================================
-    // UPDATE TRIP STATE / UI
-    // =========================================================
-
-    selectedHotel =
-      hotel;
-
-
-    latestTrip.itinerary_items =
-      latestTrip.itinerary_items.filter(
-        act =>
-          !act.is_hotel_entry
-      );
-
-
-    const checkinDate =
-      latestTrip
-        .request
-        .start_date;
-
-
-    const hotelCost =
-      Number(
-        hotel.total_num
-      ) ||
-      parseCurrencyNum(
-        hotel.total_price
-      ) ||
-      Number(
-        hotel.price_num
-      ) ||
-      parseCurrencyNum(
-        hotel.price
-      );
-
-
-    const insertIdx =
-      Math.min(
-        1,
-        latestTrip
-          .itinerary_items
-          .length
-      );
-
-
-    latestTrip
-      .itinerary_items
-      .splice(
-        insertIdx,
-        0,
-        {
-
-          date:
-            checkinDate,
-
-          start_time:
-            "14:00",
-
-          end_time:
-            "15:00",
-
-          title:
-            `🏨 Confirmed Stay: Check-in at ${hotel.name}`,
-
-          location:
-            hotel.area ||
-            latestTrip
-              .selected_destination,
-
-          description:
-            `Payment confirmed. Accommodation booking ${
-              data.booking?.booking_id ||
-              ""
-            }. ${
-              hotel.amenities ||
-              "Breakfast & WiFi included"
-            }.`,
-
-          reason:
-            "Payment Verified · Accommodation Booking Agent",
-
-          status:
-            "VERIFIED",
-
-          cost:
-            hotelCost,
-
-          cost_text:
-            hotel.total_price ||
-            hotel.nightly_price ||
-            `₹${hotelCost.toLocaleString("en-IN")}`,
-
-          is_hotel_entry:
-            true
-
-        }
-      );
-
-
-    hotelPaymentState.set(
-      paymentKey,
-      "PAID"
-    );
-
-
-    renderTrip(
-      latestTrip
-    );
-
-
-    showPaymentMessage(
-      `🏨 ${hotel.name} confirmed successfully. Booking ID: ${
-        data.booking?.booking_id ||
-        "CONFIRMED"
-      }`,
-      "success"
-    );
-
-  } catch (error) {
-
-    console.error(
-      "[ACCOMMODATION BOOKING AGENT] Confirmation failed:",
-      error
-    );
-
-
-    /*
-     * Payment succeeded but booking confirmation failed.
-     *
-     * These are intentionally treated as separate states.
-     */
-
-    showPaymentMessage(
-      "Payment succeeded, but accommodation confirmation needs attention: " +
-      error.message,
-      "error"
-    );
-
-  }
-
-}
-
-
-// =============================================================
 // PAYMENT MESSAGE
 // =============================================================
 
@@ -4398,6 +3784,45 @@ function showPaymentMessage(
     );
 
 }
+
+$("downloadDemoDocsBtn")?.addEventListener("click", () => {
+  const documents = latestTrip?.demo_booking?.payment?.documents;
+  if (!documents) return;
+  const sections = Object.entries(documents)
+    .filter(([key]) => key !== "label")
+    .map(([name, document]) => {
+      const rows = Object.entries(document)
+        .filter(([key, value]) => key !== "label" && value !== null && typeof value !== "object")
+        .map(([key, value]) => {
+          const rendered = key === "amount_minor"
+            ? `₹${(Number(value) / 100).toLocaleString("en-IN")}`
+            : String(value);
+          return `<tr><th>${esc(key.replaceAll("_", " "))}</th><td>${esc(rendered)}</td></tr>`;
+        }).join("");
+      return `<section><h2>${esc(name.replaceAll("_", " "))}</h2><table>${rows}</table></section>`;
+    }).join("");
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>TripMate sandbox booking documents</title><style>body{font:16px Arial,sans-serif;max-width:800px;margin:40px auto;padding:0 24px;color:#172033}header{border-bottom:2px solid #334155;padding-bottom:16px}h1{font-size:24px}h2{text-transform:capitalize}section{margin:24px 0;break-inside:avoid}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #cbd5e1}th{text-transform:capitalize;width:36%}.label{color:#b91c1c;font-weight:bold}@media print{button{display:none}}</style></head><body><header><h1>TripMate booking documents</h1><p class="label">${esc(documents.label || "SANDBOX / SIMULATED BOOKING")}</p><p>These documents record sandbox activity only. They are not a supplier reservation or real payment receipt.</p></header>${sections}<button onclick="window.print()">Print / Save as PDF</button></body></html>`;
+  if (typeof html2pdf === "undefined") {
+    showToast("PDF generator is unavailable. Refresh the page and try again.");
+    return;
+  }
+  const pdfContent = document.createElement("div");
+  pdfContent.style.cssText = "font:14px Arial,sans-serif;max-width:760px;margin:24px auto;padding:24px;color:#172033;background:#fff";
+  pdfContent.innerHTML = `<h1>TripMate booking documents</h1><p><strong>${esc(documents.label || "SANDBOX / SIMULATED BOOKING")}</strong></p><p>Sandbox record only; no supplier reservation or real payment.</p>${sections}`;
+  document.body.appendChild(pdfContent);
+  html2pdf().set({filename: `TripMate-booking-${latestTrip.demo_booking.booking_id || "sandbox"}.pdf`, margin: 0.4,
+    html2canvas: {scale: 2, backgroundColor: "#ffffff"}, jsPDF: {unit: "in", format: "a4", orientation: "portrait"}})
+    .from(pdfContent).save().then(() => pdfContent.remove()).catch(() => { pdfContent.remove(); showToast("Could not generate the booking PDF."); });
+  return;
+  const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `TripMate-sandbox-${latestTrip.demo_booking.booking_id || "booking"}.html`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 
 
 // =============================================================
