@@ -1607,6 +1607,14 @@ function buildTripViewModel(payload, response) {
         price_num: parseCurrencyNum(f.price || f.estimated_cost)
       })),
 
+    // Only provider-returned schedules are shown. Do not create fallback
+    // trains, invented fares, or a false booking/confirmation status.
+    trains: (response.trains || []).filter(train =>
+      train && train.status === "SCHEDULE_ONLY" && train.train_number &&
+      train.departure_time && train.arrival_time
+    ),
+    train_search: response.train_search || {},
+
     hotels:
       response.hotels &&
       response.hotels.length > 0
@@ -2114,6 +2122,61 @@ function renderFlightCards(flights) {
         })
         .join("")}
 
+    </div>
+  `;
+}
+
+
+// =============================================================
+// PROVIDER-RETURNED TRAIN SCHEDULES (NO FARES OR BOOKING CLAIMS)
+// =============================================================
+
+function renderTrainCards(trains, search = {}) {
+  const origin = latestTrip?.request?.origin || "Origin";
+  const destination = latestTrip?.selected_destination || latestTrip?.request?.destination || "Destination";
+  const travelDate = latestTrip?.request?.start_date || "Date not returned";
+  const rows = Array.isArray(trains) ? trains : [];
+
+  if (!rows.length) {
+    const unavailable = search.status === "UNAVAILABLE";
+    const heading = unavailable
+      ? "Train search could not complete"
+      : "No trains found for this route and date";
+    const message = search.message || "The train provider returned no schedule records.";
+    return `
+      <div class="empty-notice train-empty-state ${unavailable ? "is-unavailable" : ""}" role="status">
+        <strong>${esc(heading)}</strong>
+        <p>${esc(message)}</p>
+        <small>Search: ${esc(origin)} → ${esc(destination)} · ${esc(travelDate)}. Schedules only; fares, seat availability and ticket booking are not provided.</small>
+      </div>
+    `;
+  }
+
+  const alternateDateNotice = search.status === "SUGGESTIONS_RETURNED"
+    ? `<div class="train-empty-state train-date-notice" role="status"><strong>No trains on ${esc(search.requested_date || travelDate)}</strong><p>${esc(search.message || "Nearest provider-returned train dates are shown below.")}</p></div>`
+    : "";
+
+  return `
+    ${alternateDateNotice}
+    <div class="cards train-cards">
+      ${rows.map(train => `
+        <article class="data-card provider-card train-card">
+          <div class="card-header-row">
+            <div><h4>🚆 ${esc(train.train_name || train.name || "Train")}</h4>
+              <span class="sub-code">Train ${esc(train.train_number)}</span></div>
+            <span class="status-badge">Schedule only</span>
+          </div>
+          <div class="flight-timings-grid">
+            <div class="timing-block"><strong class="time">${esc(train.departure_time)}</strong>
+              <small>${esc(train.departure_station || origin)}</small></div>
+            <div class="flight-path"><span>${esc(train.duration || "Duration not returned")}</span><div class="path-line"></div></div>
+            <div class="timing-block"><strong class="time">${esc(train.arrival_time)}</strong>
+              <small>${esc(train.arrival_station || destination)}</small></div>
+          </div>
+          <div class="price-block"><strong class="price-val">Fare unavailable</strong>
+            <small>${esc(train.price_note || "Timetable only. This result does not include fare, seat availability or ticket issuance.")}</small></div>
+        </article>
+      `).join("")}
     </div>
   `;
 }
@@ -2882,6 +2945,12 @@ function renderTrip(trip) {
         trip.flights
       ),
       "Live / Estimated"
+    )}
+
+    ${section(
+      "Train schedules",
+      renderTrainCards(trip.trains, trip.train_search),
+      "RailRadar · timetable only"
     )}
 
     <div id="hotelRecommendationsSection">

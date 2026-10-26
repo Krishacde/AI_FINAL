@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from tools.tavily_tool import tavily_search
 from tools.flight_tool import resolve_location_to_iata, search_flights
+from tools.train_tool import search_trains
 from services.result_cache import configured_ttl, result_cache
 from services.sandbox_quotes import create_sandbox_hotel_quote
 
@@ -216,6 +217,8 @@ class TripState(TypedDict, total=False):
     events: list[dict]
     places: list[dict]
     flights: list[dict]
+    trains: list[dict]
+    train_search: dict[str, Any]
     hotels: list[dict]
     itinerary: list[dict]
     validation: dict
@@ -706,6 +709,29 @@ def flights(state: TripState):
     return {"flights": result, **done("Searching flights")}
 
 
+def trains(state: TripState):
+    """TrainAgent: find provider-returned Indian Railways schedules, without fares or booking claims."""
+    req = TripRequest.model_validate(state["request"])
+    destination = state.get("selected_destination")
+    if not destination:
+        return {"trains": [], "train_search": {"status": "UNAVAILABLE", "message": "Select a destination before searching train schedules."}, **done("Searching train schedules")}
+    logger.info("agent=trains provider=RailRadar status=started origin=%s destination=%s date=%s", req.origin, destination, req.start_date)
+    print(f"[PLANNER AGENT · TrainAgent] Checking RailRadar schedules from {req.origin} to {destination}...")
+    result = search_trains(req.origin, destination, req.start_date.isoformat(), limit=5)
+    if result.get("status") == "UNAVAILABLE":
+        logger.info("agent=trains provider=RailRadar status=unavailable reason=%s", result.get("message"))
+    else:
+        logger.info("agent=trains provider=RailRadar status=%s count=%d", result.get("status"), len(result.get("trains", [])))
+    return {"trains": result.get("trains", []), "train_search": {
+        "status": result.get("status"),
+        "message": result.get("message"),
+        "source": "RailRadar",
+        "requested_date": result.get("requested_date"),
+        "suggested_dates": result.get("suggested_dates", []),
+        "fare_lookup_status": result.get("fare_lookup_status"),
+    }, **done("Searching train schedules")}
+
+
 def _attach_sandbox_quotes(
     hotel_cards: list[dict],
     *,
@@ -957,12 +983,13 @@ def finish(state: TripState):
 
 
 graph = StateGraph(TripState)
-for name, fn in [("normalize", normalize), ("discovery", discovery), ("weather", weather), ("events", events), ("places", places), ("flights", flights), ("hotels", hotels), ("itinerary", itinerary), ("validate", validate), ("budget", budget), ("recommendations", recommendations), ("travel_insights", travel_insights), ("finish", finish)]:
+for name, fn in [("normalize", normalize), ("discovery", discovery), ("weather", weather), ("events", events), ("places", places), ("flights", flights), ("trains", trains), ("hotels", hotels), ("itinerary", itinerary), ("validate", validate), ("budget", budget), ("recommendations", recommendations), ("travel_insights", travel_insights), ("finish", finish)]:
     graph.add_node(name, fn)
 graph.add_edge(START, "normalize"); graph.add_edge("normalize", "discovery")
 graph.add_edge("discovery", "weather"); graph.add_edge("discovery", "events"); graph.add_edge("discovery", "places")
+graph.add_edge("discovery", "trains")
 graph.add_edge("weather", "flights"); graph.add_edge("events", "flights"); graph.add_edge("places", "flights")
-graph.add_edge("flights", "hotels"); graph.add_edge("hotels", "itinerary"); graph.add_edge("itinerary", "validate")
+graph.add_edge("flights", "hotels"); graph.add_edge("trains", "hotels"); graph.add_edge("hotels", "itinerary"); graph.add_edge("itinerary", "validate")
 graph.add_edge("validate", "budget"); graph.add_edge("budget", "recommendations"); graph.add_edge("recommendations", "travel_insights"); graph.add_edge("travel_insights", "finish"); graph.add_edge("finish", END)
 travel_graph = graph.compile()
 

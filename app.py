@@ -967,10 +967,12 @@ from pydantic import BaseModel, Field, StrictInt
 
 from agents.simulated_payment_agent import SimulatedPaymentAgent
 from agents.autonomous_trip_booking_agent import AutonomousTripBookingAgent
-from backend import RequestCancelled, TripRequest, run_travel_agent, run_trip, run_discovery, replanning_agent
+from agents.payment_llm import PaymentLLM
+from backend import RequestCancelled, TripRequest, run_trip, run_discovery, replanning_agent
 from tools.flight_tool import API_KEY as AVIATIONSTACK_API_KEY
-from services.payment_service import PaymentError, PaymentService
-from services.sandbox_quotes import create_sandbox_cab_quote
+from tools.train_tool import RAILRADAR_API_KEY, search_trains
+from services.wallet import PaymentError, Wallet
+from services.sandbox_quotes import create_sandbox_cab_quote, create_sandbox_schedule_quote
 from services.result_cache import result_cache
 from services.trip_store import trip_store
 
@@ -1052,11 +1054,6 @@ async def run_cancellable(request: Request, operation, *args, **kwargs):
         return await task
     except RequestCancelled:
         raise
-
-
-class TravelRequest(BaseModel):
-    message: str
-    thread_id: str | None = None
 
 
 class GuidedTripRequest(TripRequest):
@@ -1151,7 +1148,12 @@ def get_simulated_payment_agent() -> SimulatedPaymentAgent:
     if _simulated_payment_agent is None:
         with _simulated_payment_agent_lock:
             if _simulated_payment_agent is None:
-                _simulated_payment_agent = SimulatedPaymentAgent(PaymentService())
+                try:
+                    payment_llm = PaymentLLM.from_env()
+                except RuntimeError as exc:
+                    logger.warning("Payment LLM is not configured; guarded offline tools will be used: %s", exc)
+                    payment_llm = None
+                _simulated_payment_agent = SimulatedPaymentAgent(Wallet(), llm=payment_llm)
     return _simulated_payment_agent
 
 
@@ -1176,13 +1178,9 @@ def attach_booking_to_trip(trip: dict, booking: dict, trip_request: dict | None 
         "date": quote.get("check_in") or start_date,
         "start_time": "14:00",
         "end_time": "15:00",
-        "title": f"Sandbox accommodation confirmed: {hotel.get('name', 'Accommodation')}",
+        "title": hotel.get("name", "Accommodation"),
         "location": hotel.get("area") or trip.get("selected_destination"),
-        "description": (
-            f"Sandbox reservation {booking.get('booking_id')} · quote {quote.get('quote_id', 'unavailable')} · "
-            f"{quote.get('nights', 1)} night(s), {quote.get('rooms', 1)} room(s), {quote.get('travelers', 1)} guest(s) · "
-            f"₹{amount:,.0f} sandbox total. No supplier reservation was placed."
-        ),
+        "description": f"{quote.get('nights', 1)} night(s), {quote.get('rooms', 1)} room(s). Booking confirmed.",
         "estimated_cost": amount,
         "cost_status": "SANDBOX_CONFIRMED",
         "reason": "Autonomous sandbox booking",
@@ -1220,9 +1218,26 @@ def existing_booking_view(payment: dict, hotels: list[dict]) -> dict | None:
         "money_mode": "SIMULATED_ONLY",
         "selected_hotel": hotel,
         "selection_reason": "Existing sandbox reservation preserved; no second charge was created.",
-        "progress": [{"step": "Existing reservation reused during itinerary update.", "status": "complete"}],
         "payment": payment,
     }
+
+
+def booking_for_ui(booking: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Keep internal agent traces in server logs, not in customer-facing API payloads."""
+    if not isinstance(booking, dict):
+        return booking
+    return {key: value for key, value in booking.items() if key not in {"progress", "agent_mode", "trace", "agent_note", "error"}}
+
+
+def trip_for_ui(trip: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(trip, dict):
+        return trip
+    result = dict(trip)
+    if isinstance(result.get("sandbox_bookings"), list):
+        result["sandbox_bookings"] = [booking_for_ui(row) for row in result["sandbox_bookings"]]
+    if isinstance(result.get("demo_booking"), dict):
+        result["demo_booking"] = booking_for_ui(result["demo_booking"])
+    return result
 
 
 @app.post("/api/demo/bookings")
@@ -1280,45 +1295,6 @@ def get_demo_payment(payment_id: str):
         )
 
 
-@app.post("/api/travel")
-async def travel_planner(request: Request, request_data: TravelRequest):
-    limited = rate_limit_response(request, "travel")
-    if limited:
-        return limited
-    try:
-        user_message = request_data.message.strip()
-        if not user_message:
-            return JSONResponse(
-                status_code=400,
-                content={"success": False, "error": "Message cannot be empty."}
-            )
-
-        result = run_travel_agent(
-            user_input=user_message,
-            thread_id=request_data.thread_id
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "thread_id": result["thread_id"],
-                "answer": result["answer"],
-                "flight_results": result["flight_results"],
-                "hotel_results": result["hotel_results"],
-                "itinerary": result["itinerary"],
-                "llm_calls": result["llm_calls"],
-            }
-        )
-
-    except Exception as e:
-        logger.exception("travel_planner failed: %s", e)
-        traceback.print_exc()
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
-
-
 @app.get("/api/trips")
 async def list_saved_trips():
     """List durable trip summaries; payment status is never read from Redis."""
@@ -1330,7 +1306,40 @@ async def get_saved_trip(trip_id: str):
     trip = trip_store.get_trip(trip_id)
     if trip is None:
         return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
-    return {"success": True, "trip": trip}
+
+    # Repair saved trips created by the old station resolver automatically.
+    # This prevents a previously persisted ambiguity/no-results message from
+    # surviving after the station resolver and schedule fallback are updated.
+    train_search = trip.get("train_search") if isinstance(trip.get("train_search"), dict) else {}
+    old_message = str(train_search.get("message") or "").casefold()
+    old_rows = trip.get("trains") if isinstance(trip.get("trains"), list) else []
+    if old_rows and isinstance(old_rows[0], dict):
+        old_message = old_message or str(old_rows[0].get("message") or old_rows[0].get("error") or "").casefold()
+    stale_train_result = (
+        "multiple stations" in old_message
+        or "no scheduled trains for this route and date" in old_message
+        or (bool(old_rows) and train_search.get("fare_lookup_status") != "COMPLETED")
+    )
+    if stale_train_result:
+        request_data = trip.get("request") if isinstance(trip.get("request"), dict) else {}
+        origin = str(request_data.get("origin") or "").strip()
+        destination = str(trip.get("selected_destination") or request_data.get("destination") or "").strip()
+        travel_date = str(request_data.get("start_date") or "").strip()
+        if origin and destination and travel_date:
+            result = await asyncio.to_thread(search_trains, origin, destination, travel_date, 5)
+            trip["trains"] = result.get("trains", [])
+            trip["train_search"] = {
+                "status": result.get("status"),
+                "message": result.get("message"),
+                "source": "RailRadar",
+                "requested_date": result.get("requested_date"),
+                "suggested_dates": result.get("suggested_dates", []),
+                "fare_lookup_status": result.get("fare_lookup_status"),
+            }
+            persistence = trip_store.save_trip(trip, change_summary="Train schedules refreshed by TrainAgent")
+            trip["current_version"] = persistence["version"]
+            trip["updated_at"] = persistence["updated_at"]
+    return {"success": True, "trip": trip_for_ui(trip)}
 
 
 @app.get("/api/trips/{trip_id}/messages")
@@ -1360,7 +1369,7 @@ async def rename_saved_trip(trip_id: str, request_data: dict[str, Any]):
             trip_store.save_trip(trip, change_summary=str(request_data.get("change_summary") or "Trip plan updated"))
         if "name" in request_data and not trip_store.rename_trip(trip_id, str(request_data["name"])):
             return JSONResponse(status_code=404, content={"success": False, "error": "Saved trip not found."})
-        return {"success": True, "trip": trip_store.get_trip(trip_id)}
+        return {"success": True, "trip": trip_for_ui(trip_store.get_trip(trip_id))}
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"success": False, "error": str(exc)})
 
@@ -1384,26 +1393,40 @@ def persist_trip_booking(trip_id: str, provider_type: str, option: dict[str, Any
     payment_id = payment.get("payment_id") or booking.get("payment_id")
     if payment_id and any((row.get("payment") or {}).get("payment_id") == payment_id for row in records):
         return trip
-    records.append(booking)
+    records.append(booking_for_ui(booking))
     trip["sandbox_bookings"] = records
     activities = list(trip.get("itinerary_items") or trip.get("itinerary") or [])
-    item_name = str(option.get("name") or option.get("airline") or "Selected service")
+    item_name = str(option.get("name") or option.get("airline") or option.get("train_name") or option.get("train_number") or "Selected service")
     amount = float(payment.get("amount_minor", 0)) / 100
     if provider_type == "hotel":
         activities = [row for row in activities if not row.get("is_hotel_entry")]
         activities.append({"date": (option.get("quote") or {}).get("check_in") or (trip.get("request") or {}).get("start_date"),
-                           "start_time": "14:00", "end_time": "15:00", "title": f"Sandbox stay confirmed: {item_name}",
+                           "start_time": "14:00", "end_time": "15:00", "title": item_name,
                            "location": option.get("area") or trip.get("selected_destination"), "status": "SANDBOX_CONFIRMED",
                            "cost": amount, "is_hotel_entry": True, "booking_id": booking.get("booking_id")})
     elif provider_type == "cab":
         activities = [row for row in activities if not row.get("is_cab_entry")]
         activities.append({"date": (option.get("quote") or {}).get("travel_date") or (trip.get("request") or {}).get("start_date"),
-                           "start_time": "12:00", "end_time": "13:00", "title": f"Sandbox transfer confirmed: {item_name}",
+                           "start_time": "12:00", "end_time": "13:00", "title": item_name,
                            "location": option.get("route") or trip.get("selected_destination"), "status": "SANDBOX_CONFIRMED",
                            "cost": amount, "is_cab_entry": True, "booking_id": booking.get("booking_id")})
+    elif provider_type in {"flight", "train"}:
+        marker = "is_flight_entry" if provider_type == "flight" else "is_train_entry"
+        category = "flight" if provider_type == "flight" else "train"
+        doc_key = "flight_ticket" if category == "flight" else "train_ticket"
+        document = (payment.get("documents") or {}).get(doc_key) or {}
+        activities = [row for row in activities if not row.get(marker)]
+        activities.append({"date": (option.get("quote") or {}).get("travel_date") or (trip.get("request") or {}).get("start_date"),
+                           "start_time": option.get("departure") or option.get("departure_time") or "",
+                           "end_time": option.get("arrival") or option.get("arrival_time") or "",
+                           "title": item_name,
+                           "location": option.get("route") or f"{option.get('departure_station') or (trip.get('request') or {}).get('origin', '')} → {option.get('arrival_station') or trip.get('selected_destination', '')}",
+                           "description": "Simulated booking record and ticket document. No supplier inventory was reserved.",
+                           "status": "SANDBOX_CONFIRMED", "cost": amount, marker: True,
+                           "booking_id": booking.get("booking_id"), "document_id": document.get("document_id")})
     trip["itinerary_items"] = activities
     trip_store.save_trip(trip, change_summary=f"Sandbox {provider_type} booking confirmed")
-    return trip_store.get_trip(trip_id)
+    return trip_for_ui(trip_store.get_trip(trip_id))
 
 
 @app.post("/api/trips/{trip_id}/selections")
@@ -1426,7 +1449,7 @@ async def select_provider(
             },
         )
 
-    if request_data.provider_type not in {"flight", "hotel", "cab"}:
+    if request_data.provider_type not in {"flight", "train", "hotel", "cab"}:
         return JSONResponse(
             status_code=400,
             content={
@@ -1438,6 +1461,8 @@ async def select_provider(
     option_name = (
         request_data.option.get("name")
         or request_data.option.get("airline")
+        or request_data.option.get("train_name")
+        or request_data.option.get("train_number")
         or "Selected option"
     )
 
@@ -1464,22 +1489,10 @@ async def select_provider(
             status_code=200 if booking.get("success") else 402,
             content={"success": bool(booking.get("success")), "trip_id": trip_id,
                      "selection": {"type": "hotel", "name": option_name},
-                     "sandbox_booking": booking,
+                     "sandbox_booking": booking_for_ui(booking),
                      "trip": saved_trip,
-                     "message": "The payment agent completed the sandbox booking." if booking.get("success") else booking.get("error", "Booking failed.")},
+                     "message": "Booking confirmed." if booking.get("success") else "Payment couldn’t be completed. Please try again."},
         )
-
-    detail = (
-        request_data.option.get("flight_number")
-        or request_data.option.get("area")
-        or request_data.option.get("location")
-        or "provider option"
-    )
-
-    label = {
-        "flight": "flight",
-        "cab": "transport",
-    }[request_data.provider_type]
 
     if request_data.provider_type == "cab":
         context = request_data.trip_context
@@ -1510,32 +1523,46 @@ async def select_provider(
             status_code=200 if cab_result.get("success") else 402,
             content={"success": bool(cab_result.get("success")), "trip_id": trip_id,
                      "selection": {"type": "cab", "name": option_name},
-                     "sandbox_booking": cab_result,
+                     "sandbox_booking": booking_for_ui(cab_result),
                      "trip": saved_trip,
-                     "message": "The payment agent completed the sandbox transport booking." if cab_result.get("success") else cab_result.get("error", "Booking failed.")},
+                     "message": "Booking confirmed." if cab_result.get("success") else "Payment couldn’t be completed. Please try again."},
         )
 
-    return {
-        "success": True,
-        "trip_id": trip_id,
-        "selection": {
-            "type": request_data.provider_type,
-            "name": option_name,
-            "option": request_data.option,
-        },
-        "itinerary_update": {
-            "time": "Plan update",
-            "title": f"Selected {label}: {option_name}",
-            "description": (
-                f"{detail} added to the plan. "
-                "Connected provider APIs can replace this estimate."
-            ),
-        },
-        "message": (
-            f"{option_name} added. "
-            "Your itinerary was refreshed."
-        ),
-    }
+    if request_data.provider_type in {"flight", "train"}:
+        quote = request_data.option.get("quote") or {}
+        saved = trip_store.get_trip(trip_id)
+        saved_request = (saved or {}).get("request") or {}
+        catalog = (saved or {}).get("flights" if request_data.provider_type == "flight" else "trains") or []
+        identity = ("flight_number", "airline") if request_data.provider_type == "flight" else ("train_number", "train_name")
+        def option_key(row):
+            return tuple(str(row.get(key) or row.get("name") or "").strip().casefold() for key in identity)
+        trusted = next((row for row in catalog if option_key(row) == option_key(request_data.option)), None)
+        if not trusted or (trusted.get("quote") or {}).get("quote_id") != quote.get("quote_id"):
+            return JSONResponse(status_code=409, content={"success": False, "error": "This schedule quote is missing, stale, or does not belong to the saved trip. Refresh the trip and select again."})
+        category = request_data.provider_type
+        route = f"{saved_request.get('origin', '')} → {(saved or {}).get('selected_destination') or saved_request.get('destination') or ''}"
+        travel_date = str(trusted.get("travel_date") or saved_request.get("start_date") or "")
+        try:
+            authoritative = create_sandbox_schedule_quote(category=category, name=str(option_name), route=route,
+                                                          travel_date=travel_date, travelers=int(saved_request.get("travelers") or 1))
+            expiry = datetime.fromisoformat(str(quote.get("expires_at")))
+            current = expiry.tzinfo is not None and expiry > datetime.now(timezone.utc)
+        except (TypeError, ValueError):
+            current = False
+            authoritative = {}
+        if not current or quote.get("quote_id") != authoritative.get("quote_id") or quote.get("amount_minor") != authoritative.get("amount_minor"):
+            return JSONResponse(status_code=409, content={"success": False, "error": "This simulated quote expired or changed. Refresh the trip and select again."})
+        amount = authoritative["amount_minor"]
+        result = await asyncio.to_thread(get_simulated_payment_agent().run, trip_id,
+            [{"category": category, "name": str(option_name)[:160], "amount_minor": amount, "available": True,
+              "metadata": {"route": route, "travel_date": travel_date, "quote_id": authoritative["quote_id"],
+                           "quote_type": authoritative["quote_type"], "provider": authoritative["provider"]}}])
+        saved_trip = persist_trip_booking(trip_id, category, trusted, result)
+        return JSONResponse(status_code=200 if result.get("success") else 402,
+            content={"success": bool(result.get("success")), "trip_id": trip_id,
+                     "selection": {"type": category, "name": option_name}, "sandbox_booking": booking_for_ui(result),
+                     "trip": saved_trip, "message": "Booking confirmed." if result.get("success") else "Payment couldn’t be completed. Please try again."})
+    return JSONResponse(status_code=400, content={"success": False, "error": "Unsupported provider selection."})
 
 
 @app.post("/api/trips")
@@ -1554,6 +1581,15 @@ async def create_trip(request: Request, request_data: GuidedTripRequest):
             request_data.thread_id,
             trip_id=request_data.request_id or str(uuid.uuid4()),
         )
+        route = f"{payload.get('origin', '')} → {trip.get('selected_destination') or payload.get('destination') or ''}"
+        for flight in trip.get("flights", []):
+            if isinstance(flight, dict) and flight.get("status") != "UNAVAILABLE" and (flight.get("airline") or flight.get("flight_number")):
+                flight["quote"] = create_sandbox_schedule_quote(category="flight", name=str(flight.get("name") or flight.get("airline") or flight.get("flight_number")),
+                    route=route, travel_date=str(payload.get("start_date") or ""), travelers=int(payload.get("travelers") or 1))
+        for train in trip.get("trains", []):
+            if isinstance(train, dict) and (train.get("train_name") or train.get("train_number")):
+                train["quote"] = create_sandbox_schedule_quote(category="train", name=str(train.get("name") or train.get("train_name") or train.get("train_number")),
+                    route=route, travel_date=str(train.get("travel_date") or payload.get("start_date") or ""), travelers=int(payload.get("travelers") or 1))
         # The traveler selects a priced service first. Payment starts only after
         # an explicit selection through /api/trips/{trip_id}/selections.
         trip["demo_booking"] = None
@@ -1576,7 +1612,7 @@ async def create_trip(request: Request, request_data: GuidedTripRequest):
         trip["updated_at"] = persistence["updated_at"]
         trip_store.add_message(trip["trip_id"], "user", f"Plan a trip to {destination} from {payload.get('origin')}.")
         trip_store.add_message(trip["trip_id"], "assistant", "Initial itinerary generated by the travel-planning workflow.")
-        return JSONResponse(content={"success": True, "trip": trip})
+        return JSONResponse(content={"success": True, "trip": trip_for_ui(trip)})
     except RequestCancelled:
         return JSONResponse(status_code=499, content={"success": False, "cancelled": True, "error": "Trip research cancelled."})
     except Exception as exc:
@@ -1631,7 +1667,7 @@ async def replan_itinerary(request: Request, request_data: ReplanPayload):
         if stored_trip and request_data.expected_version is not None and request_data.expected_version != stored_trip.get("current_version"):
             return JSONResponse(status_code=409, content={"success": False, "error": "This itinerary has changed since it was loaded. Refresh the saved trip before applying another edit."})
         current_items = stored_trip.get("itinerary_items") or stored_trip.get("itinerary") or [] if stored_trip else request_data.itinerary
-        agent_itinerary = [item for item in current_items if isinstance(item, dict) and not (item.get("is_flight_entry") or item.get("is_hotel_entry") or item.get("is_cab_entry"))]
+        agent_itinerary = [item for item in current_items if isinstance(item, dict) and not (item.get("is_flight_entry") or item.get("is_train_entry") or item.get("is_hotel_entry") or item.get("is_cab_entry"))]
         saved_request = (stored_trip or {}).get("request") or {}
         agent_context = {
             **request_data.trip_context,
@@ -1646,7 +1682,7 @@ async def replan_itinerary(request: Request, request_data: ReplanPayload):
         )
         if stored_trip and isinstance(result.get("itinerary"), list):
             old_items = stored_trip.get("itinerary_items") or stored_trip.get("itinerary") or []
-            preserved = [item for item in old_items if isinstance(item, dict) and (item.get("is_flight_entry") or item.get("is_hotel_entry") or item.get("is_cab_entry"))]
+            preserved = [item for item in old_items if isinstance(item, dict) and (item.get("is_flight_entry") or item.get("is_train_entry") or item.get("is_hotel_entry") or item.get("is_cab_entry"))]
             stored_trip["itinerary_items"] = preserved + result["itinerary"]
             stored_trip["itinerary"] = result["itinerary"]
             if result.get("hotel_search_performed"):
@@ -1656,6 +1692,10 @@ async def replan_itinerary(request: Request, request_data: ReplanPayload):
             trip_store.add_message(request_data.trip_id, "user", request_data.change_text)
             trip_store.add_message(request_data.trip_id, "assistant", result.get("change_summary") or "Itinerary updated by the replanning workflow.")
             result["trip"] = stored_trip
+        if "progress" in result:
+            result.pop("progress", None)
+        if isinstance(result.get("trip"), dict):
+            result["trip"] = trip_for_ui(result["trip"])
         # Replanning changes the itinerary only. It must never choose or buy a
         # newly suggested hotel; the traveler can select it from refreshed cards.
         return JSONResponse(content={"success": True, **result})
@@ -1680,15 +1720,17 @@ async def diagnostics():
         "GEMINI_API_KEY": key_state("GEMINI_API_KEY"),
         "TAVILY_API_KEY": key_state("TAVILY_API_KEY"),
         "AVIATIONSTACK_API_KEY": key_state("AVIATIONSTACK_API_KEY"),
+        "RAILRADAR_API_KEY": key_state("RAILRADAR_API_KEY"),
         "DATABASE_URL": key_state("DATABASE_URL"),
     }
     logger.info("request=diagnostics keys=%s", keys)
     return {
         "status": "ok",
-        "keys": {name: "configured" if value else "missing" for name, value in keys.items()},
+        "keys": keys,
         "cache": result_cache.status(),
         "notes": {
             "AVIATIONSTACK_API_KEY": "Live flight status lookup.",
+            "RAILRADAR_API_KEY": "Optional RailRadar schedule and fare quote lookup; does not provide seat reservation or ticketing.",
             "GEMINI_API_KEY": "Required for multi-agent reasoning, ranking, planning and replanning.",
             "TAVILY_API_KEY": "Required for web research, verified events, and hotel evidence."
         }
@@ -1724,5 +1766,9 @@ if __name__ == "__main__":
         "app:app",
         host="127.0.0.1",
         port=8000,
-        reload=False
+        # This entry point is the local development server. Reloading prevents
+        # the UI from continuing to call an old imported train resolver after
+        # backend source changes.
+        reload=True,
+        reload_dirs=[str(BASE_DIR)],
     )

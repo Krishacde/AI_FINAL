@@ -34,7 +34,7 @@ export const api = {
     request<ApiEnvelope<{ destinations: Destination[]; scout_summary?: string; progress?: unknown[]; warnings?: string[] }>>("/api/discover", { method: "POST", body: JSON.stringify(payload), signal }),
   replan: (payload: Record<string, unknown>, signal?: AbortSignal) =>
     request<ReplanResponse>("/api/trips/replan", { method: "POST", body: JSON.stringify(payload), signal }),
-  select: (tripId: string, providerType: "hotel" | "cab" | "flight", option: unknown, tripContext: unknown, signal?: AbortSignal) =>
+  select: (tripId: string, providerType: "hotel" | "cab" | "flight" | "train", option: unknown, tripContext: unknown, signal?: AbortSignal) =>
     request<ApiEnvelope<{ sandbox_booking?: BookingResult; selection?: unknown; itinerary_update?: unknown; trip?: Trip | null }>>(
       `/api/trips/${encodeURIComponent(tripId)}/selections`,
       { method: "POST", body: JSON.stringify({ trip_id: tripId, provider_type: providerType, option, trip_context: tripContext }), signal },
@@ -43,11 +43,6 @@ export const api = {
   topUp: (amountMinor: number, idempotencyKey: string) =>
     request<ApiEnvelope<{ wallet: Wallet }>>("/api/sandbox/wallet/topups", { method: "POST", body: JSON.stringify({ amount_minor: amountMinor, idempotency_key: idempotencyKey }) }),
   payment: (paymentId: string, signal?: AbortSignal) => request<Payment>(`/api/sandbox/payments/${encodeURIComponent(paymentId)}`, { signal }),
-  diagnostics: (signal?: AbortSignal) => request<Record<string, unknown>>("/api/diagnostics", { signal }),
   health: (signal?: AbortSignal) => request<Record<string, unknown>>("/health", { signal }),
-  legacyTravel: (message: string, threadId?: string, signal?: AbortSignal) =>
-    request<ApiEnvelope<{ thread_id?: string; answer?: string; itinerary?: unknown[]; flight_results?: unknown[]; hotel_results?: unknown[]; llm_calls?: number }>>("/api/travel", {
-      method: "POST", body: JSON.stringify({ message, thread_id: threadId }), signal,
-    }),
 };
 

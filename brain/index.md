@@ -1,5 +1,5 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-10-06T10:21:08.072Z._
+_Auto-generated. Last updated 2026-10-25T08:44:36.331Z._
 
-_(no Pages yet)_
+- [railradar-train-schedules](pages/railradar-train-schedules.md) — category: decision | tags: [railradar, trains, provider-safety] | ## Decision

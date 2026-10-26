@@ -78,3 +78,28 @@ def create_sandbox_cab_quote(*, name: str, route: str, travel_date: str) -> dict
     return {"quote_id": quote_id, "provider": "TripMate sandbox transport inventory", "quote_type": "SANDBOX",
             "currency": "INR", "amount_minor": price * 100, "travel_date": travel_date,
             "route": route, "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()}
+
+
+def create_sandbox_schedule_quote(*, category: str, name: str, route: str, travel_date: str, travelers: int = 1) -> dict[str, Any]:
+    """Create a clearly simulated flight/train quote; it never represents a live fare."""
+    prices = {"flight": 6500, "train": 1500}
+    if category not in prices:
+        raise ValueError("Unsupported sandbox schedule category.")
+    travelers = max(1, min(9, int(travelers)))
+    key = f"{category}|{name.casefold()}|{route.casefold()}|{travel_date}|{travelers}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    # Small reproducible variation makes options interactive while remaining a test price.
+    per_traveler = prices[category] + (int(digest[:4], 16) % 7 - 3) * 100
+    amount = max(500, per_traveler) * travelers * 100
+    return {
+        "quote_id": f"{category[:1].upper()}Q-{digest[:14].upper()}",
+        "provider": "TripMate simulated schedule inventory",
+        "quote_type": "SIMULATED_TEST_PRICE",
+        "currency": "INR",
+        "amount_minor": amount,
+        "travelers": travelers,
+        "travel_date": travel_date,
+        "route": route,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+        "note": "Test price only; not a supplier fare or reservation.",
+    }

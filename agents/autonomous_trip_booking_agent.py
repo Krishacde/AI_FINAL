@@ -57,6 +57,7 @@ class AutonomousTripBookingAgent:
                     "transaction_id": existing["transaction_id"],
                     "amount_minor": existing["amount_minor"],
                     "money_mode": "SIMULATED_ONLY",
+                    "agent_mode": "idempotent_reuse",
                     "selected_hotel": hotel or {"name": booked_item["name"], "price_num": booked_item["amount_minor"] // 100},
                     "selection_reason": "Returned the existing confirmed booking for this request; no second payment was made.",
                     "progress": [{"step": "Existing successful booking found; reused its receipt and voucher.", "status": "complete"}],
@@ -172,6 +173,7 @@ class AutonomousTripBookingAgent:
             "money_mode": "SIMULATED_ONLY",
             "selected_hotel": hotel,
             "selection_reason": choice_reason,
+            "agent_mode": payment_result.get("agent_mode"),
             "progress": [
                 {"step": f"Traveler selected {hotel.get('name', 'an eligible stay')}; the payment agent validated the quote: {choice_reason}" if option_index is not None else f"Accommodation agent selected {hotel.get('name', 'an eligible stay')}: {choice_reason}", "status": "complete"},
                 *payment_result.get("progress", []),

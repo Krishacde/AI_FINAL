@@ -22,7 +22,6 @@ export function DiscoveryPage({ onPlan }: Props) {
   const [cards, setCards] = useState<Destination[]>([]);
   const [selected, setSelected] = useState<Destination[]>([]);
   const [summary, setSummary] = useState("");
-  const [progress, setProgress] = useState<unknown[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [details, setDetails] = useState<Destination | null>(null);
@@ -36,17 +35,16 @@ export function DiscoveryPage({ onPlan }: Props) {
     event.preventDefault();
     if (days < 1 || days > 30) { setError("Choose a date range of 1 to 30 days."); return; }
     const active = new AbortController(); controller.current = active;
-    setBusy(true); setError(null); setProgress([]);
+    setBusy(true); setError(null);
     try {
       const month = new Date(`${startDate}T12:00:00`).toLocaleString("en-US", { month: "long" });
       const year = Number(startDate.slice(0, 4));
       const result = await api.discover({ origin: origin.trim(), month, year, start_date: startDate, end_date: endDate, days,
         interests, pace, budget: budget === "flexible" ? null : Number(budget), mood: interests.slice(0, 2).join(" + ") || "Nature & Culture" }, active.signal);
       setCards(result.destinations || []); setSelected([]); setSummary(result.scout_summary || "");
-      setProgress(Array.isArray(result.progress) ? result.progress : []);
     } catch (cause) {
-      if (cause instanceof DOMException && cause.name === "AbortError") setError("Research paused. You can submit a new search when ready.");
-      else setError(cause instanceof Error ? cause.message : "Destination research failed.");
+      if (cause instanceof DOMException && cause.name === "AbortError") setError("Destination search was paused. You can try again when ready.");
+      else setError(cause instanceof Error ? cause.message : "Could not find destinations right now.");
     } finally { setBusy(false); controller.current = null; }
   }
 
@@ -62,8 +60,8 @@ export function DiscoveryPage({ onPlan }: Props) {
 
   return <main className="app-container discovery-page">
     <a className="back-link" href="/">← Back to Trip Planner</a>
-    <section className="hero-section"><div className="badge">✦ Multi-Agent Destination Scout</div><h1>Help me choose a destination.</h1><p>Share your starting point, dates, and interests. The existing discovery agents research and rank candidate destinations.</p></section>
-    <section className="planner-card"><div className="step-label">Flow 2 · Discovery Scout</div><h2>Where and when are you starting?</h2>
+    <section className="hero-section"><div className="badge">✦ TripMate · Destination ideas</div><h1>Let’s find your next getaway.</h1><p>Share your starting point, dates, and interests to see destinations that fit your trip.</p></section>
+    <section className="planner-card"><div className="step-label">Destination planner</div><h2>Where and when are you starting?</h2>
       <form onSubmit={submit}>
         <div className="form-grid discover-main-grid">
           <label>📍 Starting / Nearby Location<input required value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder="e.g. Mumbai or Delhi" /></label>
@@ -76,11 +74,9 @@ export function DiscoveryPage({ onPlan }: Props) {
           <div className="form-grid"><label>Travel pace<select value={pace} onChange={(e) => setPace(e.target.value)}><option value="relaxed">Relaxed</option><option value="balanced">Balanced</option><option value="fast">Fast-paced</option></select></label><label>Approx. Budget<select value={budget} onChange={(e) => setBudget(e.target.value)}><option value="flexible">Flexible</option><option value="30000">Under ₹30,000</option><option value="60000">Under ₹60,000</option><option value="120000">Under ₹1,20,000</option></select></label></div>
         </details>
         {error && <div className="error" role="alert">{error}</div>}
-        <div className="agent-action-row"><button className="primary" disabled={busy} type="submit">{busy ? <><span className="loader" /> Researching destinations…</> : <>Scout Destinations <span>→</span></>}</button>{busy && <button className="cancel-btn" type="button" onClick={() => controller.current?.abort()}>Pause research</button>}</div>
+        <div className="agent-action-row"><button className="primary" disabled={busy} type="submit">{busy ? <><span className="loader" /> Finding destinations…</> : <>Find Destinations <span>→</span></>}</button>{busy && <button className="cancel-btn" type="button" onClick={() => controller.current?.abort()}>Pause search</button>}</div>
       </form>
     </section>
-    {busy && <section className="result-section"><h2>LangGraph Destination Scout</h2><p className="progress-active">Research request is running. The backend reports detailed agent progress when the operation returns.</p></section>}
-    {progress.length > 0 && <section className="result-section"><h2>Agent progress</h2><div className="progress-list">{progress.map((item, index) => <pre key={index}>{typeof item === "string" ? item : JSON.stringify(item, null, 2)}</pre>)}</div></section>}
     {cards.length > 0 && <section className="result-section"><div className="result-header"><div><h2>Recommended Destinations</h2><p className="section-note">{summary}</p></div></div><div className="cards clean-destinations-grid">{cards.map((card) => {
       const isSelected = selected.some((item) => item.name === card.name);
       return <article className={`data-card clean-destination-card ${isSelected ? "is-selected" : ""}`} key={card.name}>

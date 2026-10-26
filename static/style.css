@@ -1463,6 +1463,23 @@ select:focus {
     margin: 12px 0;
 }
 
+.train-empty-state {
+    margin: 0;
+    padding: 18px 20px;
+    border: 1px dashed rgba(148, 163, 184, 0.42);
+    border-radius: 12px;
+    color: #dbeafe;
+    background: rgba(15, 23, 42, 0.46);
+    line-height: 1.55;
+}
+
+.train-empty-state strong { display: block; margin-bottom: 5px; color: #f1f5f9; }
+.train-empty-state p { margin: 0 0 6px; }
+.train-empty-state small { color: #a8b8cc; }
+.train-empty-state.is-unavailable { border-style: solid; border-color: rgba(251, 191, 36, 0.42); }
+.train-date-notice { margin-bottom: 14px; border-style: solid; border-color: rgba(251, 191, 36, 0.32); }
+.train-card .price-block { margin-top: 12px; }
+
 .timing-block {
     display: flex;
     flex-direction: column;

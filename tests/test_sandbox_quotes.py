@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from services.sandbox_quotes import create_sandbox_cab_quote, create_sandbox_hotel_quote
+from services.sandbox_quotes import create_sandbox_cab_quote, create_sandbox_hotel_quote, create_sandbox_schedule_quote
 
 
 class SandboxQuoteTests(unittest.TestCase):
@@ -43,6 +43,18 @@ class SandboxQuoteTests(unittest.TestCase):
         self.assertEqual(first["quote_type"], "SANDBOX")
         with self.assertRaises(ValueError):
             create_sandbox_cab_quote(name="Unsupported Cab", route=args["route"], travel_date=args["travel_date"])
+
+    def test_schedule_quotes_are_stable_and_labeled_as_simulated(self) -> None:
+        args = {"category": "flight", "name": "Example Air 123", "route": "DEL → GOI", "travel_date": "2026-10-26", "travelers": 2}
+        first = create_sandbox_schedule_quote(**args)
+        second = create_sandbox_schedule_quote(**args)
+        self.assertEqual(first["quote_id"], second["quote_id"])
+        self.assertEqual(first["amount_minor"], second["amount_minor"])
+        self.assertEqual(first["travelers"], 2)
+        self.assertEqual(first["quote_type"], "SIMULATED_TEST_PRICE")
+        self.assertIn("not a supplier fare", first["note"])
+        with self.assertRaises(ValueError):
+            create_sandbox_schedule_quote(category="activity", name="Tour", route="Goa", travel_date="2026-10-26")
 
 
 if __name__ == "__main__":

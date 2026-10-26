@@ -34,6 +34,7 @@ export type Activity = {
   booking_id?: string;
   document_id?: string;
   is_flight_entry?: boolean;
+  is_train_entry?: boolean;
   is_hotel_entry?: boolean;
   is_cab_entry?: boolean;
   [key: string]: unknown;
@@ -54,6 +55,19 @@ export type Quote = {
   travel_date?: string;
   route?: string;
   expires_at?: string;
+};
+
+export type TrainFareQuote = Quote & {
+  amount: number;
+  train_number: string;
+  source_station_code: string;
+  destination_station_code: string;
+  class_code: string;
+  quota_code: string;
+  breakdown: Record<string, number>;
+  fetched_at: string;
+  bookable: false;
+  note: string;
 };
 
 export type TravelOption = {
@@ -78,8 +92,18 @@ export type TravelOption = {
   arrival?: string;
   stops?: string;
   cabin?: string;
+  train_name?: string;
+  train_number?: string;
+  departure_station?: string;
+  arrival_station?: string;
+  departure_time?: string;
+  arrival_time?: string;
+  travel_date?: string;
+  run_days?: string[];
+  distance_km?: number | null;
+  fare?: TrainFareQuote | null;
+  quote?: TrainFareQuote;
   status?: string;
-  quote?: Quote;
   [key: string]: unknown;
 };
 
@@ -100,6 +124,7 @@ export type Payment = {
 
 export type BookingResult = {
   success: boolean;
+  agent_mode?: "llm_tool_calls" | "safe_offline_tools" | "idempotent_reuse" | string;
   status?: string;
   booking_status?: string;
   booking_id?: string;
@@ -124,6 +149,8 @@ export type Trip = {
   itinerary?: Activity[];
   itinerary_items?: Activity[];
   flights?: TravelOption[];
+  trains?: TravelOption[];
+  train_search?: { status?: string; message?: string | null; source?: string; requested_date?: string; suggested_dates?: string[]; fare_lookup_status?: string };
   hotels?: TravelOption[];
   cabs?: TravelOption[];
   warnings?: string[];

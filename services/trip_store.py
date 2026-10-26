@@ -22,7 +22,7 @@ def _json(value: Any) -> str:
 class TripStore:
     """Durable trip, itinerary-version, and conversation store.
 
-    Payment and wallet truth remain in PaymentService's ledger database; this
+    Payment and wallet truth remain in Wallet's payment database; this
     store contains trip snapshots and references only, never payment secrets.
     """
 

@@ -73,16 +73,16 @@ export function PlannerForm({ onSubmit, onOpenDiscovery, busy, error, initial }:
   return (
     <>
       <section className="hero-section">
-        <div className="badge">✈️ TripMate AI · Gemini + LangGraph</div>
-        <h1>Plan with research, not guesses.</h1>
-        <p>Multi-agent trip planning with researched stays, selectable sandbox bookings, and itinerary updates.</p>
+        <div className="badge">✈️ TripMate · Your travel planner</div>
+        <h1>Plan a trip that feels like yours.</h1>
+        <p>Tell us where you’re going, and TripMate will shape a day-by-day plan around your dates and preferences.</p>
       </section>
       {initial && <section className="discovery-handoff-banner"><div className="banner-content"><span className="banner-icon">✨</span><div><strong>Destination loaded from Discovery</strong><p>Review the trip details and let the planner build your itinerary.</p></div></div></section>}
       <section className="planner-card" id="planner">
         <div className="step-label">Trip Planning Hub</div>
         <h2>How would you like to plan?</h2>
         <div className="mode-grid">
-          <div className="mode-card active"><span>📍</span><strong>I know my destination</strong><small>Build a researched itinerary around specific destinations.</small></div>
+          <div className="mode-card active"><span>📍</span><strong>Plan a destination</strong><small>Build an itinerary around the places you want to visit.</small></div>
           <button className="mode-card" type="button" onClick={onOpenDiscovery}><span>✨</span><strong>Help me choose</strong><small>Scout evidence-backed getaways from your starting point.</small></button>
         </div>
         <form onSubmit={submit}>
@@ -101,8 +101,8 @@ export function PlannerForm({ onSubmit, onOpenDiscovery, busy, error, initial }:
           <fieldset className="choices"><legend>Interests &amp; Experiences</legend><div id="interests">{interestsList.map((tag) => <button className={interests.includes(tag) ? "selected" : ""} type="button" key={tag} aria-pressed={interests.includes(tag)} onClick={() => setInterests((current) => current.includes(tag) ? current.filter((x) => x !== tag) : [...current, tag])}>{tag}</button>)}</div></fieldset>
           <label className="full">📝 Special requirements<input value={specialRequirements} onChange={(e) => setSpecialRequirements(e.target.value)} placeholder="Optional: less walking, vegetarian food, accessibility needs…" /></label>
           {error && <div className="error" role="alert">{error}</div>}
-          <div className="agent-action-row"><button className="primary" type="submit" disabled={busy}>{busy ? <><span className="loader" /> Researching with the agent team…</> : <>Generate Multi-Agent Trip Plan <span>→</span></>}</button></div>
-          <p className="section-note">Your trip and itinerary changes are saved to trip history. Research and booking options reflect the data returned by configured providers.</p>
+          <div className="agent-action-row"><button className="primary" type="submit" disabled={busy}>{busy ? <><span className="loader" /> Planning your trip…</> : <>Build my trip plan <span>→</span></>}</button></div>
+          <p className="section-note">Your trip and itinerary changes are saved so you can come back anytime.</p>
         </form>
       </section>
     </>
