@@ -1,4 +1,4 @@
-﻿# ✈️ TripMate AI — A Multi-Agent Travel Planner with LangGraph
+# ✈️ TripMate AI — A Multi-Agent Travel Planner with LangGraph
 
 An intelligent, multi-agent AI travel planning platform that turns natural-language trip requests into comprehensive, customized travel plans—complete with real-time flight suggestions, hotel recommendations, activity schedules, and structured day-by-day itineraries.
 
@@ -9,11 +9,13 @@ Built with **LangGraph**, **FastAPI**, **LangChain**, and **Google Gemini**.
 ## 🌟 Key Features
 
 - 🤖 **Multi-Agent Orchestration**: Specialized agents handle flight research, hotel discovery, itinerary planning, and response synthesis.
+- 💳 **Autonomous Sandbox Booking**: LangGraph validates a sandbox quote against trip and wallet policy, records an idempotent payment, and issues a dated sandbox reservation record and receipt. No supplier reservation or real payment is made.
 - ✈️ **Flight Discovery**: Real-time airline and schedule lookups powered by AviationStack.
+- 🚆 **Train Schedules**: Optional RailRadar timetable search for Indian routes. The integration displays provider-returned schedules only; it does not claim fares, seat availability, bookings, or tickets.
 - 🏨 **Hotel & Destination Research**: Live web search and location research powered by Tavily.
 - 📋 **Structured Itinerary Planning**: Pydantic-validated, day-by-day activity schedules and budget allocation.
-- 💾 **State Persistence**: Multi-turn conversation and session state checkpointing with PostgreSQL.
-- 🌐 **Modern Web Interface**: Responsive frontend with intuitive travel forms, discovery dashboard, and itinerary export.
+- 💾 **Persistent Trips**: SQLite stores saved trip snapshots, itinerary versions, and trip edit messages. The React UI restores a trip from the backend using its saved ID; the LangGraph graph itself still has no checkpoint saver.
+- 🌐 **React Web Interface**: React + TypeScript frontend with Vite development, destination discovery, planner, booking, and itinerary export.
 
 ---
 
@@ -23,8 +25,9 @@ Built with **LangGraph**, **FastAPI**, **LangChain**, and **Google Gemini**.
 - **Agent Orchestration**: LangGraph, LangChain
 - **LLM**: Google Gemini (`google-genai`), Groq
 - **Tools & APIs**: Tavily API, AviationStack API
-- **Database / State**: PostgreSQL (`psycopg[binary]`, `langgraph-checkpoint-postgres`)
-- **Frontend**: HTML5, CSS3, JavaScript, Jinja2 Templates
+- **Database / State**: SQLite for durable trips, itinerary versions, and the sandbox payment ledger; PostgreSQL is an optional payment-ledger backend
+- **Cache**: Redis for reusable public provider lookups, with an in-process fallback
+- **Frontend**: React, TypeScript, Vite; existing Jinja templates and static browser client retained as a fallback during migration
 
 ---
 
@@ -34,7 +37,11 @@ Built with **LangGraph**, **FastAPI**, **LangChain**, and **Google Gemini**.
 ├── app.py                     # FastAPI application entry point & routes
 ├── backend.py                 # LangGraph multi-agent workflow & state graph
 ├── requirements.txt           # Python dependencies
-├── static/                    # Frontend static assets (CSS, JS, media)
+├── frontend/                  # React/Vite application
+│   ├── src/                   # Planner, discovery, itinerary, booking, API client
+│   ├── package.json           # Frontend scripts and dependencies
+│   └── vite.config.ts         # API proxy for local development
+├── static/                    # Existing styles and legacy browser scripts (fallback)
 │   ├── style.css              # Application styling
 │   ├── script.js             # Client-side planner interactions
 │   └── discover.js           # Discovery page scripts
@@ -56,8 +63,10 @@ Built with **LangGraph**, **FastAPI**, **LangChain**, and **Google Gemini**.
 
 Ensure you have installed:
 - [Python 3.10+](https://www.python.org/downloads/)
-- [PostgreSQL](https://www.postgresql.org/download/) (running locally or cloud database)
+- [Node.js 20.19+ or 22.12+](https://nodejs.org/) for the React frontend
 - [Git](https://git-scm.com/)
+
+Redis is optional. Without a Redis server, TripMate uses a bounded in-process cache and the rest of the app continues to work. For shared caching, install Redis locally or use a managed Redis service and set `REDIS_URL`.
 
 ---
 
@@ -105,9 +114,6 @@ cp .env.example .env
 Open `.env` in your editor and provide your keys:
 
 ```env
-# Database configuration
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/tripmate
-
 # LLM API Keys
 GEMINI_API_KEY=your_gemini_api_key_here
 GROQ_API_KEY=your_groq_api_key_here
@@ -115,6 +121,7 @@ GROQ_API_KEY=your_groq_api_key_here
 # Tool API Keys
 TAVILY_API_KEY=your_tavily_api_key_here
 AVIATIONSTACK_API_KEY=your_aviationstack_api_key_here
+RAILRADAR_API_KEY=your_railradar_api_key_here  # optional train schedules
 
 # Default Departure Airport
 DEFAULT_ORIGIN_IATA=JFK
@@ -124,15 +131,61 @@ DEFAULT_ORIGIN_IATA=JFK
 
 ### 6. Run the Application
 
-Start the server using:
+### Development with the React client
 
-```bash
-python app.py
+Install frontend packages once, then start React and FastAPI together from the `frontend` folder:
+
+```powershell
+cd frontend
+npm ci
+npm run dev:full
 ```
+
+Open **`http://127.0.0.1:5173/`**. Vite proxies `/api`, `/health`, and `/static` to FastAPI on port 8000. Saved trip links use `/trips/{trip_id}`. Set `PYTHON` if the launcher must use a specific Python executable.
+
+To build the production React client:
+
+```powershell
+cd frontend
+npm ci
+npm run build
+```
+
+FastAPI serves that build at `/` and `/discover`. The existing Jinja frontend is used only when the built React files are absent. The Dockerfile builds React before packaging the Python application.
+
+### Start the built app directly
+
+Start the server from PowerShell using the launcher. It selects the project's virtual environment when present, then the parent workspace environment:
+
+```powershell
+.\run.ps1
+```
+
+If starting manually, activate the virtual environment first and then run `python app.py`.
 
 Then open your browser and visit:
 
 👉 **`http://127.0.0.1:8000/`**
+
+Accommodation search results receive reproducible sandbox quotes based on stay dates, traveler count, and room count. The rates can be tuned with `SANDBOX_HOTEL_BASE_NIGHTLY_INR` and `SANDBOX_HOTEL_RATE_SPREAD_PERCENT`. The traveler chooses a hotel or local cab; the payment agent checks the quote and wallet policy, processes a sandbox transaction, issues returned booking documents, and adds the confirmed sandbox item to the itinerary. These amounts are test rates, not supplier prices; no real room or cab is reserved and no real payment is taken. Documents are labeled `SANDBOX / SIMULATED BOOKING`.
+
+The payment workflow checks the saved option, server quote, wallet balance, and payment limits before capturing simulated funds. When `GEMINI_API_KEY` (or `MODEL_NAME` plus `MODEL_API_KEY`) is configured, one LLM agent chooses a single no-argument payment tool per turn. Server code validates each tool and `services/wallet.py` owns every balance/payment mutation. Without model credentials, the same guarded tools run in a safe offline sequence. Hotel and cab amounts come from TripMate sandbox catalogs. Flight and train schedules use clearly labeled deterministic test prices so travelers can exercise the same checkout and confirmation flow; those prices are not supplier fares, and their generated documents are not valid tickets. No real supplier inventory is reserved. Cab options are local test inventory, not provider quotes. See [the payment flow diagram](docs/payment-booking-flow.md) for the end-to-end flow and failure paths.
+
+Train search is optional and requires a RailRadar API key in `RAILRADAR_API_KEY`. RailRadar station lookups and timetable results use the configured result cache. A cache-cold route can require station lookups plus timetable requests, so check your provider plan and quota before using it frequently. See the [RailRadar trains-between API](https://railradar.in/docs/trains-between-stations) and [station lookup API](https://railradar.in/docs/search-stations). Station matches are resolved automatically; if RailRadar rejects a city-wide query as ambiguous, the search retries with the resolved station codes. If station resolution still fails, the key is missing, or the provider is rate-limited/unavailable, planning continues and the train section reports a safe provider error. Train schedule cards never use sample trains or inferred prices.
+
+Trip planning uses the structured `/api/trips` workflow. The retired natural-language `/api/travel` route is not available. Structured itinerary edits are saved as trip messages and itinerary versions.
+
+Trip snapshots, saved itinerary versions, and planner/edit messages are stored in a separate SQLite database. By default it is `%LOCALAPPDATA%/TripMateAI/trips.sqlite3` on Windows (or the equivalent user data directory on other platforms); set `TRIPMATE_TRIPS_DB` to choose a path. The payment/wallet database (`SIMULATED_PAYMENT_DB`) is managed by `services/wallet.py` and is authoritative for payment status. On refresh the frontend stores only the last trip ID and fetches the trip from the backend. Saved trips survive browser and backend restarts. The current project has no user authentication, so saved-trip APIs are suitable for this single-user/demo deployment only; add authorization and per-user ownership before exposing it to multiple users.
+
+The simulated ledger uses SQLite under the current user's application-data directory by default. To use PostgreSQL for this ledger, set `SIMULATED_PAYMENT_DATABASE_URL` to its connection URL; this setting is separate from `DATABASE_URL` so unrelated application database credentials are not used for simulated bookings. You can instead set `SIMULATED_PAYMENT_DB` to a specific SQLite file path. Wallet and policy amounts are paise: the example configuration uses ₹100,000 for the wallet, ₹100,000 per transaction, and ₹200,000 per day.
+
+To use a locally installed Redis server, start it using your operating system's normal service command, then set `REDIS_URL=redis://127.0.0.1:6379/0` in `.env`. A managed Redis URL can be used instead. `/api/diagnostics` reports whether Redis is connected. Repeated Tavily, AviationStack, Open-Meteo forecast, and geocoding lookups use Redis. If Redis is not configured or cannot be reached, the app uses a bounded in-process cache; this fallback is not shared across server workers. Docker and Docker Compose are not required to run TripMate; the Dockerfile is optional for users who choose to build a container image.
+
+Run the simulated payment and compensation tests with:
+
+```bash
+python -m unittest tests.test_simulated_payments -v
+```
 
 ---
 
@@ -143,18 +196,25 @@ Then open your browser and visit:
 | `GET` | `/` | Main travel planner web interface |
 | `GET` | `/discover` | Destination inspiration & discovery view |
 | `GET` | `/health` | Server health check endpoint |
-| `POST` | `/api/travel` | Natural-language trip planning endpoint |
 | `POST` | `/api/trips` | Structured guided planner submission |
+| `POST` | `/api/trips/{trip_id}/selections` | Traveler selects a flight schedule, hotel, or sandbox cab option |
+| `GET` | `/api/sandbox/wallet` | Read simulated wallet balances |
+| `POST` | `/api/sandbox/wallet/topups` | Add bounded simulated funds to the agent wallet |
+| `GET` | `/api/sandbox/payments/{payment_id}` | Read simulated payment and booking status |
+| `POST` | `/api/trips/replan` | Run the itinerary replanning agent |
+| `POST` | `/api/discover` | Run the destination discovery graph |
+| `GET` | `/api/diagnostics` | Report configured service and cache status |
 
 ---
 
 ## 🧠 Multi-Agent Workflow
 
 1. **User Request**: User provides travel destination, dates, preferences, and budget.
-2. **Flight Agent**: Gathers available flight options and schedules.
-3. **Hotel Agent**: Researches matching accommodations and neighborhood spots.
-4. **Itinerary Agent**: Coordinates flights, hotels, and points of interest into daily schedules.
-5. **Final Response Agent**: Formats the synthesized plan for real-time frontend rendering.
+2. **Research Agents**: Gather destination, weather, event, flight-status, optional train timetable, hotel, and activity evidence; identical provider queries can be served from cache.
+3. **Itinerary Agent**: Builds and validates the day-by-day plan.
+4. **Traveler Selection**: The traveler explicitly selects any returned hotel, cab, flight schedule, or train schedule and authorizes its sandbox checkout; trip generation does not automatically purchase an option.
+5. **Payment Agent**: Validates server-returned sandbox quote details and wallet/payment policy, then runs authorization, reservation, confirmation, capture, settlement, and compensation stages.
+6. **Document and Itinerary Update**: On backend-confirmed sandbox payment, issues the returned voucher/receipt and updates the itinerary. No real travel inventory or money is involved.
 
 ---
 

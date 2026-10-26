@@ -17,7 +17,7 @@
     <section class="hero-section">
       <div class="badge">✈️ TripMate AI · Gemini + LangGraph</div>
       <h1>Plan with research, not guesses.</h1>
-      <p>Multi-agent LangGraph system with evidence-backed itineraries, interactive flight & hotel selections, and instant replanning.</p>
+      <p>Multi-agent trip planning with researched stays, automatic sandbox booking, and itinerary updates.</p>
     </section>
 
     <!-- DISCOVERY HANDOFF BANNER (Shown when redirected from 'Help me choose') -->
@@ -136,10 +136,37 @@
           <input id="requirements" placeholder="Optional: less walking, vegetarian food, accessibility needs…">
         </label>
 
-        <button class="primary" type="submit" id="planSubmitBtn">
-          Generate Multi-Agent Trip Plan <span>→</span>
-        </button>
+        <div class="agent-action-row">
+          <button class="primary" type="submit" id="planSubmitBtn">
+            Generate Multi-Agent Trip Plan <span>→</span>
+          </button>
+          <button class="cancel-btn hidden" type="button" id="planCancelBtn">Pause research</button>
+        </div>
       </form>
+      <div class="wallet-panel">
+        <div><strong>Agent sandbox wallet:</strong> <span id="walletBalance">Loading…</span></div>
+        <label for="walletTopUpAmount">Add sandbox funds (₹)</label>
+        <input id="walletTopUpAmount" type="number" min="1" max="1000000" step="1" value="10000">
+        <button class="secondary-btn" id="walletTopUpBtn" type="button">Add sandbox funds</button>
+        <small>Simulated funds only. No real money is collected.</small>
+      </div>
+    </section>
+
+    <section id="paymentAgentPanel" class="payment-agent-panel hidden" aria-live="polite">
+      <div class="payment-agent-header">
+        <div>
+          <div class="step-label">TripMate AI · Sandbox</div>
+          <h2>Autonomous Booking Activity</h2>
+        </div>
+      </div>
+      <div class="payment-agent-status-row">
+        <span><strong>Status:</strong> <span id="paymentAgentStatusText">Idle</span></span>
+        <span><strong>Booking / transaction:</strong> <span id="paymentAgentOrderText">—</span></span>
+      </div>
+      <div id="paymentAgentProgress" class="payment-agent-progress"></div>
+      <div id="paymentAgentDocuments" class="payment-agent-progress"></div>
+      <button id="downloadDemoDocsBtn" class="secondary-btn hidden" type="button">Download booking ticket & receipt PDF</button>
+      <p class="section-note">Sandbox only. No real payment or supplier reservation is made.</p>
     </section>
 
     <!-- LIVE RESEARCH PROGRESS -->
@@ -152,7 +179,7 @@
     <section id="resultSection" class="result-section hidden">
       <div class="result-header">
         <div>
-          <h2>Your Verified Multi-Agent Travel Plan</h2>
+      <h2>Your Multi-Agent Travel Plan</h2>
           <p id="tripId" class="section-note"></p>
         </div>
         <div class="header-action-group">
@@ -194,10 +221,11 @@
   </button>
 
   <footer>
-    Gemini Reasoning · LangGraph Multi-Agent Orchestration · Anti-Hallucination Verified Evidence
+    Gemini · LangGraph Multi-Agent Orchestration · Sandbox booking workflow
   </footer>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
-  <script src="/static/script.js"></script>
+
+<script src="/static/script.js?v=20261007-sandbox-quotes"></script>
 </body>
 </html>

@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import sys
+import contextvars
+import threading
 import uuid
 from datetime import date, datetime, timezone
 from typing import Annotated, Any, Literal, Optional, TypedDict
@@ -23,7 +25,10 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, field_validator
 
 from tools.tavily_tool import tavily_search
-from tools.flight_tool import search_flights
+from tools.flight_tool import resolve_location_to_iata, search_flights
+from tools.train_tool import search_trains
+from services.result_cache import configured_ttl, result_cache
+from services.sandbox_quotes import create_sandbox_hotel_quote
 
 load_dotenv()
 
@@ -51,6 +56,20 @@ os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
 
 DataStatus = Literal["LIVE", "VERIFIED", "ESTIMATED", "AI_RECOMMENDATION", "USER_PROVIDED", "CREATOR_REPORTED", "UNAVAILABLE"]
+
+request_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "request_cancel_event", default=None
+)
+
+
+class RequestCancelled(Exception):
+    """Raised between agent/provider calls when the browser cancels a request."""
+
+
+def raise_if_cancelled() -> None:
+    event = request_cancel_event.get()
+    if event and event.is_set():
+        raise RequestCancelled("Request cancelled by the client.")
 
 
 # =====================================================================
@@ -122,12 +141,15 @@ class CleanHotelCard(BaseModel):
     price_num: int = Field(description="Numeric total stay price in INR, e.g. 13500")
     amenities: str = Field(description="Key amenities e.g. 'Ayurvedic Spa · Swimming Pool · Free Breakfast · AC · Lake View'")
     booking_url: Optional[str] = Field(default=None, description="Direct booking or reference website URL")
-    source: str = Field(default="Verified Hotel Directory", description="Reference source")
-    status: DataStatus = "VERIFIED"
+    source: str = Field(default="Tavily research evidence", description="Reference source")
+    status: DataStatus = "AI_RECOMMENDATION"
 
 
 class HotelListSchema(BaseModel):
     hotels: list[CleanHotelCard] = Field(description="4 to 6 clean, verified hotel recommendations with exact real property names")
+
+
+MAX_SIMULATED_HOTEL_STAY_INR = 100_000
 
 
 class CleanTravelInsights(BaseModel):
@@ -165,6 +187,7 @@ class DiscoveryState(TypedDict, total=False):
     origin: str
     month: str
     year: int
+    days: int
     interests: list[str]
     mood: Optional[str]
     weather_preference: Optional[str]
@@ -194,6 +217,8 @@ class TripState(TypedDict, total=False):
     events: list[dict]
     places: list[dict]
     flights: list[dict]
+    trains: list[dict]
+    train_search: dict[str, Any]
     hotels: list[dict]
     itinerary: list[dict]
     validation: dict
@@ -310,9 +335,11 @@ gemini = GeminiService()
 
 
 def research(query: str, limit: int = 6) -> tuple[list[dict], list[str]]:
+    raise_if_cancelled()
     logger.info("agent=research status=started query='%s'", query)
     print(f"[TAVILY SEARCH] Query: '{query}' (limit={limit})")
     result = tavily_search(query, limit)
+    raise_if_cancelled()
     if not result["success"]:
         logger.warning("agent=research provider=Tavily status=failed error=%s", result["error"])
         print(f"[TAVILY SEARCH] ❌ Failed: {result.get('error')}")
@@ -331,15 +358,16 @@ def research(query: str, limit: int = 6) -> tuple[list[dict], list[str]]:
 def agent_nearby_destinations(state: DiscoveryState) -> dict:
     origin = state["origin"]
     month = state.get("month", "this month")
+    days = state.get("days", 5)
     interests = state.get("interests", [])
     interest_str = f" for {', '.join(interests)}" if interests else ""
     
     logger.info("agent=NearbyDestinationAgent origin=%s month=%s", origin, month)
     print(f"\n[AGENT 1/5: NearbyDestinationAgent] Scouting getaways near '{origin}' for {month}...")
-    query = f"top travel destinations weekend getaways from {origin} to visit in {month} India{interest_str} tourism"
+    query = f"top travel destinations from {origin} for a {days}-day trip to visit in {month} India{interest_str} tourism"
     sources, warnings = research(query, limit=8)
     
-    query_regional = f"places to visit near {origin} {month} weather attractions"
+    query_regional = f"places to visit near {origin} within a {days}-day itinerary {month} weather attractions"
     sources_reg, _ = research(query_regional, limit=5)
     all_sources = sources + sources_reg
     
@@ -388,10 +416,11 @@ def agent_weather(state: DiscoveryState) -> dict:
 def agent_destination_research(state: DiscoveryState) -> dict:
     origin = state["origin"]
     month = state.get("month", "August")
+    days = state.get("days", 5)
     
     logger.info("agent=DestinationResearchAgent origin=%s", origin)
     print(f"[AGENT 4/5: DestinationResearchAgent] Checking connectivity & travel times from '{origin}'...")
-    query = f"best things to do road trips train connectivity travel times from {origin} {month}"
+    query = f"best things to do road trips train connectivity travel times from {origin} in a {days}-day trip {month}"
     sources, warnings = research(query, limit=6)
     
     return {
@@ -406,6 +435,7 @@ def agent_destination_ranking(state: DiscoveryState) -> dict:
     origin = state["origin"]
     month = state.get("month", "August")
     year = state.get("year", datetime.now().year)
+    days = state.get("days", 5)
     interests = state.get("interests", [])
     
     logger.info("agent=DestinationRankingAgent synthesizing clean cards for origin=%s", origin)
@@ -415,6 +445,7 @@ def agent_destination_ranking(state: DiscoveryState) -> dict:
         "origin": origin,
         "month": month,
         "year": year,
+        "days": days,
         "interests": interests,
         "raw_candidates_count": len(state.get("candidates_raw", [])),
         "raw_candidate_snippets": [s.get("snippet", "") for s in state.get("candidates_raw", [])[:10]],
@@ -426,7 +457,7 @@ def agent_destination_ranking(state: DiscoveryState) -> dict:
     
     prompt = f"""
 You are the Destination Ranking Agent for TripMate AI.
-Your goal is to recommend 5 to 8 CLEAN, CONCISE DESTINATION CARDS for a traveler starting from "{origin}" in "{month} {year}".
+Your goal is to recommend 5 to 8 CLEAN, CONCISE DESTINATION CARDS for a traveler starting from "{origin}" in "{month} {year}" with exactly {days} total trip days, including travel from and back to the starting location.
 
 STRICT RULES:
 1. NO RAW SEARCH DUMPS: Do not output article titles ("15 Best...", "Travel Guide..."), long paragraphs, or search snippets.
@@ -435,7 +466,8 @@ STRICT RULES:
    - For 'special_this_month': ONLY include an event/festival if it genuinely takes place in {month} for the year {year}.
    - If no specific event is verified, leave 'special_this_month' as None or mention a seasonal natural highlight (e.g. 'Lush green monsoon scenery'). Set 'special_is_verified' to True only if year-specific evidence exists.
 4. GEOGRAPHIC ACCURACY: Find realistic, accessible destinations starting from {origin}.
-5. STATUS & SOURCE: Attach status ('VERIFIED' or 'AI_RECOMMENDATION') and real source attribution.
+5. STRICT DURATION FIT: Recommend ONLY destinations that can realistically be visited within exactly {days} total days, including round-trip travel, arrival, departure, and the listed attractions. Do not suggest a destination if its travel time or required minimum stay makes this impossible. Prefer closer destinations for shorter trips. Make every 'travel_time' and attraction list consistent with this limit.
+6. STATUS & SOURCE: Attach status ('VERIFIED' or 'AI_RECOMMENDATION') and real source attribution.
 
 GATHERED EVIDENCE:
 {json.dumps(gathered_evidence)}
@@ -449,7 +481,7 @@ GATHERED EVIDENCE:
     else:
         logger.warning("agent=DestinationRankingAgent dynamic fallback_synthesis invoked")
         print(f"[DISCOVERY] Synthesizing clean cards dynamically from search evidence for '{origin}'...")
-        cards = _fallback_discovery_synthesis(origin, month, year, interests, state.get("sources", []))
+        cards = _fallback_discovery_synthesis(origin, month, year, days, interests, state.get("sources", []))
         summary = f"Curated {len(cards)} top destinations accessible from {origin} for {month} {year}."
 
     print(f"[DISCOVERY] ✓ Finished: Generated {len(cards)} destination recommendation cards")
@@ -460,7 +492,7 @@ GATHERED EVIDENCE:
     }
 
 
-def _fallback_discovery_synthesis(origin: str, month: str, year: int, interests: list[str], sources: list[dict]) -> list[dict]:
+def _fallback_discovery_synthesis(origin: str, month: str, year: int, days: int, interests: list[str], sources: list[dict]) -> list[dict]:
     """Dynamically parses and synthesizes clean destination cards from live search evidence for ANY origin."""
     extracted_names = []
     
@@ -503,11 +535,11 @@ def _fallback_discovery_synthesis(origin: str, month: str, year: int, interests:
             "name": name,
             "region": f"Accessible from {origin}",
             "match_score": max(75, base_score - (idx * 3)),
-            "why_visit": f"Ideal getaway from {origin} featuring seasonal highlights and scenic experiences in {month} {year}.",
+            "why_visit": f"A realistic {days}-day getaway from {origin} featuring seasonal highlights and scenic experiences in {month} {year}.",
             "special_this_month": f"Seasonal climate & local festivities for {month}",
             "special_is_verified": False,
             "best_for": (interests if interests else ["Nature", "Culture", "Relaxation"])[:3],
-            "travel_time": f"Drive or regional transit ~{2 + idx}–{4 + idx} hrs from {origin}",
+            "travel_time": f"Drive or regional transit ~{min(2 + idx, max(1, days * 2 - 2))}–{min(4 + idx, max(2, days * 3 - 2))} hrs from {origin}; fits a {days}-day trip",
             "estimated_budget": f"₹{12000 + idx * 3000:,}–₹{22000 + idx * 4000:,} / person",
             "key_attractions": [f"Iconic highlights of {name}", "Scenic viewpoints", "Regional cultural heritage"],
             "weather_summary": f"Pleasant seasonal weather for {month}",
@@ -537,15 +569,24 @@ disc_graph.add_edge("ranking_agent", END)
 discovery_graph = disc_graph.compile()
 
 
-def run_discovery(origin: str, month: str, year: int = 2026, interests: list[str] = None, mood: str = None) -> dict:
-    logger.info("discovery_started origin=%s month=%s year=%s", origin, month, year)
+def run_discovery(origin: str, month: str, year: int = 2026, days: int = 5, interests: list[str] = None, mood: str = None, cancellation_event: threading.Event | None = None) -> dict:
+    token = request_cancel_event.set(cancellation_event)
+    try:
+        return _run_discovery(origin, month, year, days, interests, mood)
+    finally:
+        request_cancel_event.reset(token)
+
+
+def _run_discovery(origin: str, month: str, year: int = 2026, days: int = 5, interests: list[str] = None, mood: str = None) -> dict:
+    logger.info("discovery_started origin=%s month=%s year=%s days=%s", origin, month, year, days)
     print(f"\n=======================================================")
-    print(f"🚀 [FLOW 2: DISCOVERY SCOUT] Starting for: '{origin}' ({month} {year})")
+    print(f"🚀 [FLOW 2: DISCOVERY SCOUT] Starting for: '{origin}' ({month} {year}, {days} days)")
     print(f"=======================================================")
     initial_state = {
         "origin": origin,
         "month": month,
         "year": year,
+        "days": days,
         "interests": interests or [],
         "mood": mood or "Culture and Nature",
         "sources": [],
@@ -596,11 +637,27 @@ def weather(state: TripState):
     if not destination:
         return {"weather": unavailable("Open-Meteo", "Select a destination first"), **done("Checking weather")}
     try:
-        geo = requests.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": destination.split(",")[0], "count": 1}, timeout=12).json()
+        def fetch_json(url: str, params: dict, namespace: str, ttl: int):
+            def load():
+                response = requests.get(url, params=params, timeout=12)
+                response.raise_for_status()
+                return response.json()
+            return result_cache.get_or_load(namespace, params, ttl, load)[0]
+
+        geo = fetch_json(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            {"name": destination.split(",")[0], "count": 1},
+            "open-meteo-geocoding", configured_ttl("GEOCODING_CACHE_TTL_SECONDS", 2592000),
+        )
         place = (geo.get("results") or [None])[0]
         if not place:
             raise ValueError("Destination could not be geocoded")
-        daily = requests.get("https://api.open-meteo.com/v1/forecast", params={"latitude": place["latitude"], "longitude": place["longitude"], "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code", "timezone": "auto", "start_date": str(req.start_date), "end_date": str(req.end_date)}, timeout=12).json().get("daily")
+        forecast_params = {"latitude": place["latitude"], "longitude": place["longitude"], "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code", "timezone": "auto", "start_date": str(req.start_date), "end_date": str(req.end_date)}
+        forecast = fetch_json(
+            "https://api.open-meteo.com/v1/forecast", forecast_params,
+            "open-meteo-forecast", configured_ttl("WEATHER_CACHE_TTL_SECONDS", 1800, maximum=86400),
+        )
+        daily = forecast.get("daily")
         if not daily:
             raise ValueError("Forecast unavailable (dates may be beyond the 16-day forecast window)")
         result = {"status": "LIVE", "source": "Open-Meteo", "fetched_at": now(), "location": place["name"], "daily": [{"date": d, "max_c": daily["temperature_2m_max"][i], "min_c": daily["temperature_2m_min"][i], "rain_probability": daily["precipitation_probability_max"][i], "weather_code": daily["weather_code"][i]} for i, d in enumerate(daily["time"])]}
@@ -638,6 +695,10 @@ def flights(state: TripState):
     destination = state.get("selected_destination")
     if not destination:
         return {"flights": [unavailable("AviationStack", "Select a destination first")], **done("Searching flights")}
+    if not resolve_location_to_iata(req.origin) or not resolve_location_to_iata(destination):
+        reason = f"No airport match for the complete route {req.origin} to {destination}; flight search was skipped."
+        logger.info("agent=flights provider=AviationStack status=skipped reason=%s", reason)
+        return {"flights": [unavailable("AviationStack", reason)], **done("Searching flights")}
     logger.info("agent=flights provider=AviationStack status=started origin=%s destination=%s", req.origin, destination)
     print(f"[PLANNER AGENT 5/11: FlightAgent] Checking flight routes from {req.origin} to {destination}...")
     result = search_flights(f"flights from {req.origin} to {destination}", limit=5)
@@ -646,6 +707,67 @@ def flights(state: TripState):
         return {"flights": [{"status": "UNAVAILABLE", "source": "AviationStack", "fetched_at": now(), "message": result}], **done("Searching flights")}
     logger.info("agent=flights provider=AviationStack status=complete")
     return {"flights": result, **done("Searching flights")}
+
+
+def trains(state: TripState):
+    """TrainAgent: find provider-returned Indian Railways schedules, without fares or booking claims."""
+    req = TripRequest.model_validate(state["request"])
+    destination = state.get("selected_destination")
+    if not destination:
+        return {"trains": [], "train_search": {"status": "UNAVAILABLE", "message": "Select a destination before searching train schedules."}, **done("Searching train schedules")}
+    logger.info("agent=trains provider=RailRadar status=started origin=%s destination=%s date=%s", req.origin, destination, req.start_date)
+    print(f"[PLANNER AGENT · TrainAgent] Checking RailRadar schedules from {req.origin} to {destination}...")
+    result = search_trains(req.origin, destination, req.start_date.isoformat(), limit=5)
+    if result.get("status") == "UNAVAILABLE":
+        logger.info("agent=trains provider=RailRadar status=unavailable reason=%s", result.get("message"))
+    else:
+        logger.info("agent=trains provider=RailRadar status=%s count=%d", result.get("status"), len(result.get("trains", [])))
+    return {"trains": result.get("trains", []), "train_search": {
+        "status": result.get("status"),
+        "message": result.get("message"),
+        "source": "RailRadar",
+        "requested_date": result.get("requested_date"),
+        "suggested_dates": result.get("suggested_dates", []),
+        "fare_lookup_status": result.get("fare_lookup_status"),
+    }, **done("Searching train schedules")}
+
+
+def _attach_sandbox_quotes(
+    hotel_cards: list[dict],
+    *,
+    destination: str,
+    check_in: date,
+    check_out: date,
+    travelers: int,
+    accommodation: str | None,
+) -> list[dict]:
+    nights = max(1, (check_out - check_in).days)
+    for hotel in hotel_cards:
+        quote = create_sandbox_hotel_quote(
+            hotel=hotel,
+            destination=destination,
+            check_in=check_in.isoformat(),
+            check_out=check_out.isoformat(),
+            nights=nights,
+            travelers=travelers,
+            accommodation=accommodation,
+        )
+        price_num = quote["amount_minor"] // 100
+        hotel["status"] = "AI_RECOMMENDATION"
+        hotel["quote"] = quote
+        hotel["quote_type"] = "SANDBOX"
+        hotel["price_source"] = quote["provider"]
+        if price_num > MAX_SIMULATED_HOTEL_STAY_INR:
+            hotel["price_num"] = 0
+            hotel["total_price"] = "Exceeds sandbox payment limit"
+            hotel["nightly_price"] = f"₹{quote['nightly_rate_minor'] // 100:,} sandbox rate per night"
+            hotel["price_note"] = f"Sandbox total exceeds ₹{MAX_SIMULATED_HOTEL_STAY_INR:,} per booking."
+            continue
+        hotel["price_num"] = price_num
+        hotel["total_price"] = f"₹{price_num:,} sandbox total for {nights} night(s)"
+        hotel["nightly_price"] = f"₹{quote['nightly_rate_minor'] // 100:,} sandbox rate per night"
+        hotel["price_note"] = f"Sandbox quote · {quote['rooms']} room(s) · {nights} night(s) · no supplier inventory"
+    return hotel_cards
 
 
 def hotels(state: TripState):
@@ -666,9 +788,10 @@ Extract 4 to 6 REAL, INDIVIDUAL HOTELS / RESORTS for a stay in "{destination}" m
 CRITICAL RULES:
 1. NO SEARCH DUMPS / NO ARTICLE TITLES: Never output "11 Best Hotels...", "Top 10 Hotels...", "Hotels in ... Book with Free Cancellation".
 2. REAL PROPERTY NAMES: Every item must have the exact real hotel/resort name (e.g. "Spice Village - CGH Earth", "Taj Lake Palace", "Trident Hotel", "Cardamom County Resort").
-3. REALISTIC PRICING: Provide realistic nightly and total stay prices in INR (e.g. ₹3,500/night to ₹8,000/night).
-4. REAL BOOKING URL: Attach the booking website URL or reference link from the evidence.
-5. AMENITIES & RATING: Specify realistic amenities and rating.
+3. PRICING: Do not generate prices. The application attaches a deterministic sandbox quote after validating the dates and party size.
+4. DISPLAY PRICING: Do not claim the sandbox quote is a hotel supplier rate or a live price.
+5. REAL BOOKING URL: Attach the booking website URL or reference link from the evidence.
+6. AMENITIES & RATING: Specify realistic amenities and rating.
 
 EVIDENCE GATHERED:
 {json.dumps([{"title": s["title"], "snippet": s["snippet"], "url": s["url"]} for s in sources])}
@@ -680,12 +803,21 @@ EVIDENCE GATHERED:
         logger.warning("agent=hotels fallback_hotel_synthesis invoked")
         print(f"[HOTELS] Synthesizing hotel cards dynamically for '{destination}'...")
         hotel_cards = _fallback_hotel_synthesis(destination, accommodation_type, sources)
-        
-    return {"hotels": hotel_cards, "sources": sources, "warnings": warnings, **done("Hotels & stays verified")}
+
+    hotel_cards = _attach_sandbox_quotes(
+        hotel_cards,
+        destination=destination,
+        check_in=req.start_date,
+        check_out=req.end_date,
+        travelers=req.travelers,
+        accommodation=accommodation_type,
+    )
+
+    return {"hotels": hotel_cards, "sources": sources, "warnings": warnings, **done("Hotel recommendations and sandbox quotes ready")}
 
 
 def _fallback_hotel_synthesis(destination: str, accommodation_type: str, sources: list[dict] = None) -> list[dict]:
-    """Dynamically extracts hotel cards from live search evidence for any destination."""
+    """Extract property names from search evidence; never create properties, prices, or amenities."""
     base_url = f"https://www.booking.com/searchresults.html?ss={requests.utils.quote(destination)}"
     extracted_hotels = []
 
@@ -697,18 +829,7 @@ def _fallback_hotel_synthesis(destination: str, accommodation_type: str, sources
                 clean_name = f_name.strip()
                 if clean_name not in [h[0] for h in extracted_hotels] and len(clean_name) > 5:
                     url = s.get("url") or base_url
-                    extracted_hotels.append((clean_name, f"Central {destination}", "4.7 ★ (500+ reviews)", "₹4,800 / night", "₹14,400 (3 nights)", 14400, "Free Breakfast · Swimming Pool · Wi-Fi · AC Deluxe", url))
-
-    if len(extracted_hotels) < 4:
-        samples = [
-            (f"{destination} Grand Heritage Palace", f"Historic Quarter, {destination}", "4.8 ★ (820+ reviews)", "₹6,500 / night", "₹19,500 (3 nights)", 19500, "Royal Heritage Architecture · Spa · Pool · Multi-Cuisine Dining", base_url),
-            (f"{destination} Nature & Eco Resort", f"Scenic Outskirts, {destination}", "4.7 ★ (640+ reviews)", "₹5,200 / night", "₹15,600 (3 nights)", 15600, "Eco-Friendly Cottages · Garden Pool · Mountain Views · Free Breakfast", base_url),
-            (f"{destination} Boutique Inn & Suites", f"City Center Promenade, {destination}", "4.6 ★ (450+ reviews)", "₹3,800 / night", "₹11,400 (3 nights)", 11400, "Modern AC Rooms · Rooftop Cafe · Free Airport Shuttle · Wi-Fi", base_url),
-            (f"{destination} Lakeview / Valley Residency", f"Waterfront Vista, {destination}", "4.6 ★ (310+ reviews)", "₹4,200 / night", "₹12,600 (3 nights)", 12600, "Panoramic Views · Ayurvedic Wellness · Free Breakfast · Terrace", base_url)
-        ]
-        for s in samples:
-            if s[0] not in [h[0] for h in extracted_hotels]:
-                extracted_hotels.append(s)
+                    extracted_hotels.append((clean_name, "Location unavailable", "Rating unavailable", "Price unavailable", "Price unavailable", 0, "Amenities unavailable", url))
 
     hotels_list = []
     for s in extracted_hotels[:5]:
@@ -721,8 +842,8 @@ def _fallback_hotel_synthesis(destination: str, accommodation_type: str, sources
             "price_num": s[5],
             "amenities": s[6],
             "booking_url": s[7] if s[7] else base_url,
-            "source": "TripMate Verified Hotels Directory",
-            "status": "VERIFIED"
+            "source": "Search evidence",
+            "status": "UNVERIFIED"
         })
     return hotels_list
 
@@ -862,17 +983,31 @@ def finish(state: TripState):
 
 
 graph = StateGraph(TripState)
-for name, fn in [("normalize", normalize), ("discovery", discovery), ("weather", weather), ("events", events), ("places", places), ("flights", flights), ("hotels", hotels), ("itinerary", itinerary), ("validate", validate), ("budget", budget), ("recommendations", recommendations), ("travel_insights", travel_insights), ("finish", finish)]:
+for name, fn in [("normalize", normalize), ("discovery", discovery), ("weather", weather), ("events", events), ("places", places), ("flights", flights), ("trains", trains), ("hotels", hotels), ("itinerary", itinerary), ("validate", validate), ("budget", budget), ("recommendations", recommendations), ("travel_insights", travel_insights), ("finish", finish)]:
     graph.add_node(name, fn)
 graph.add_edge(START, "normalize"); graph.add_edge("normalize", "discovery")
 graph.add_edge("discovery", "weather"); graph.add_edge("discovery", "events"); graph.add_edge("discovery", "places")
+graph.add_edge("discovery", "trains")
 graph.add_edge("weather", "flights"); graph.add_edge("events", "flights"); graph.add_edge("places", "flights")
-graph.add_edge("flights", "hotels"); graph.add_edge("hotels", "itinerary"); graph.add_edge("itinerary", "validate")
+graph.add_edge("flights", "hotels"); graph.add_edge("trains", "hotels"); graph.add_edge("hotels", "itinerary"); graph.add_edge("itinerary", "validate")
 graph.add_edge("validate", "budget"); graph.add_edge("budget", "recommendations"); graph.add_edge("recommendations", "travel_insights"); graph.add_edge("travel_insights", "finish"); graph.add_edge("finish", END)
 travel_graph = graph.compile()
 
 
-def run_trip(request_data: dict[str, Any], thread_id: str | None = None) -> dict:
+def run_trip(
+    request_data: dict[str, Any],
+    thread_id: str | None = None,
+    cancellation_event: threading.Event | None = None,
+    trip_id: str | None = None,
+) -> dict:
+    token = request_cancel_event.set(cancellation_event)
+    try:
+        return _run_trip(request_data, thread_id, trip_id)
+    finally:
+        request_cancel_event.reset(token)
+
+
+def _run_trip(request_data: dict[str, Any], thread_id: str | None = None, trip_id: str | None = None) -> dict:
     req = TripRequest.model_validate(request_data)
     tid = thread_id or f"trip_{uuid.uuid4().hex}"
     dest_str = req.destination or (", ".join(req.selected_destinations) if req.selected_destinations else "auto")
@@ -880,7 +1015,7 @@ def run_trip(request_data: dict[str, Any], thread_id: str | None = None) -> dict
     print(f"\n=======================================================")
     print(f"✈️ [FLOW 1: ITINERARY PLANNER] Starting for '{dest_str}' ({req.start_date} to {req.end_date})")
     print(f"=======================================================")
-    result = travel_graph.invoke({"trip_id": str(uuid.uuid4()), "thread_id": tid, "request": req.model_dump(mode="json"), "sources": [], "warnings": [], "progress": []})
+    result = travel_graph.invoke({"trip_id": trip_id or str(uuid.uuid4()), "thread_id": tid, "request": req.model_dump(mode="json"), "sources": [], "warnings": [], "progress": []})
     logger.info("trip_complete thread_id=%s warnings=%d", tid, len(result.get("warnings", [])))
     print(f"=======================================================")
     print(f"✓ [FLOW 1: ITINERARY PLANNER] Complete: {len(result.get('itinerary', []))} itinerary activities, {len(result.get('hotels', []))} hotels")
@@ -923,7 +1058,7 @@ def replanning_agent(change_text: str, current_itinerary: list[dict], trip_conte
         
         prompt_hotels = f"""
 Extract 3 to 5 REAL, INDIVIDUAL HOTELS / RESORTS matching this user request: "{change_text}" in destination "{destination}".
-CRITICAL: NO ARTICLE TITLES (NO "Top 10..."). Real hotel names, exact location, realistic price in INR, amenities, and booking website URL.
+CRITICAL: NO ARTICLE TITLES (NO "Top 10..."). Extract only property names and details supported by evidence. Do not invent rates; the application attaches sandbox quotes.
 EVIDENCE:
 {json.dumps([{"title": s["title"], "snippet": s["snippet"], "url": s["url"]} for s in sources])}
 """
@@ -932,8 +1067,23 @@ EVIDENCE:
             updated_hotels = [h.model_dump() for h in hotel_res.hotels]
         else:
             updated_hotels = _fallback_hotel_synthesis(destination, change_text, sources)
+
+        try:
+            check_in = date.fromisoformat(str(trip_context["start_date"]))
+            check_out = date.fromisoformat(str(trip_context["end_date"]))
+            updated_hotels = _attach_sandbox_quotes(
+                updated_hotels,
+                destination=destination,
+                check_in=check_in,
+                check_out=check_out,
+                travelers=max(1, int(trip_context.get("travelers", 1))),
+                accommodation=trip_context.get("accommodation") or "Mid-range hotel",
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Hotel replanning skipped sandbox quotes because trip dates or party size were missing.")
+            updated_hotels = []
             
-        change_summary = f"Found {len(updated_hotels)} verified properties matching: '{change_text}'."
+        change_summary = f"Found {len(updated_hotels)} accommodation options matching: '{change_text}'."
         print(f"[REPLANNING AGENT] ✓ Found {len(updated_hotels)} hotels for '{change_text}'")
 
     # Adjust itinerary activities based on user prompt
@@ -964,6 +1114,7 @@ INSTRUCTIONS:
         "success": True,
         "itinerary": updated_itinerary,
         "updated_hotels": updated_hotels,
+        "hotel_search_performed": is_hotel_query,
         "change_summary": change_summary,
         "affected_elements": ["hotels", "itinerary"] if updated_hotels else ["itinerary"]
     }

@@ -5,6 +5,7 @@ import airportsdata
 import pycountry
 import requests
 from dotenv import load_dotenv
+from services.result_cache import configured_ttl, result_cache
 
 load_dotenv()
 
@@ -272,7 +273,10 @@ def resolve_location_to_iata(location: str):
         if location_clean in name:
             score += 50
 
-        if "international" in name:
+        # This is only a ranking bonus for an airport that already matched the
+        # requested city. Previously it made every international airport a
+        # candidate, so unknown towns (for example Saputara) resolved to ZZE.
+        if score > 0 and "international" in name:
             score += 10
 
         if score > 0:
@@ -487,13 +491,26 @@ def search_flights(query: str, limit: int = 10):
     if arr_iata:
         params["arr_iata"] = arr_iata
 
-    try:
-        response = requests.get(BASE_URL, params=params, timeout=30)
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        return f"Flight API request failed: {e}"
-    except ValueError:
-        return "Flight API returned invalid JSON."
+    def fetch():
+        try:
+            response = requests.get(BASE_URL, params=params, timeout=30)
+            response.raise_for_status()
+            return {"success": True, "data": response.json()}
+        except requests.exceptions.RequestException as exc:
+            return {"success": False, "error": f"Flight API request failed: {exc}"}
+        except ValueError:
+            return {"success": False, "error": "Flight API returned invalid JSON."}
+
+    cached, _cache_hit = result_cache.get_or_load(
+        "aviationstack-flights",
+        {"departure": dep_iata, "arrival": arr_iata, "limit": min(limit, 100)},
+        ttl_seconds=configured_ttl("FLIGHT_CACHE_TTL_SECONDS", 120, maximum=3600),
+        loader=fetch,
+        should_cache=lambda value: bool(value.get("success") and "error" not in value.get("data", {})),
+    )
+    if not cached.get("success"):
+        return cached.get("error", "Flight API request failed.")
+    data = cached["data"]
 
     if "error" in data:
         error = data["error"]

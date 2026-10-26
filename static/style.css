@@ -116,7 +116,8 @@ body {
 }
 
 .planner-card,
-.result-section {
+.result-section,
+.payment-agent-panel {
     background: rgba(15, 23, 42, 0.78);
     border: 1px solid rgba(148, 163, 184, 0.25);
     box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
@@ -125,6 +126,105 @@ body {
     padding: 28px;
     margin-bottom: 28px;
 }
+
+.payment-agent-panel {
+    margin-top: 16px;
+}
+
+.payment-agent-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.payment-agent-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.payment-agent-actions button {
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.7);
+    color: #e2e8f0;
+    padding: 8px 12px;
+    cursor: pointer;
+}
+
+.payment-agent-actions .danger {
+    border-color: rgba(248, 113, 113, 0.6);
+    color: #fecaca;
+}
+
+.payment-agent-status-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    color: #cbd5e1;
+    margin-bottom: 12px;
+}
+
+.payment-agent-progress {
+    display: grid;
+    gap: 8px;
+    color: #dbeafe;
+    font-size: 0.95rem;
+}
+
+.payment-document {
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    border-radius: 12px;
+    padding: 12px;
+}
+
+.payment-document dl {
+    display: grid;
+    gap: 6px;
+    margin: 8px 0 0;
+}
+
+.payment-document dl div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.payment-document dt {
+    color: #94a3b8;
+    text-transform: capitalize;
+}
+
+.payment-document dd {
+    margin: 0;
+    text-align: right;
+    overflow-wrap: anywhere;
+}
+
+.wallet-panel {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 18px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(148, 163, 184, 0.2);
+    color: #cbd5e1;
+}
+
+.wallet-panel input {
+    width: 130px;
+    padding: 9px;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    background: #0f172a;
+    color: white;
+}
+
+.wallet-panel small { flex-basis: 100%; color: #94a3b8; }
 
 .step-label {
     color: #a78bfa;
@@ -196,7 +296,7 @@ body {
 }
 
 .discover-main-grid {
-    grid-template-columns: 2fr 1.2fr 1fr;
+    grid-template-columns: 2fr 1.2fr 1fr 1fr;
 }
 
 .form-grid label,
@@ -318,6 +418,34 @@ select:focus {
     opacity: 0.7;
     cursor: wait;
     transform: none;
+}
+
+.agent-action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.agent-action-row .primary {
+    flex: 1 1 280px;
+    width: auto;
+}
+
+.cancel-btn {
+    min-height: 46px;
+    padding: 10px 16px;
+    border: 1px solid rgba(248, 113, 113, 0.7);
+    border-radius: 12px;
+    background: rgba(127, 29, 29, 0.35);
+    color: #fecaca;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.cancel-btn:hover {
+    background: rgba(153, 27, 27, 0.55);
 }
 
 /* PROGRESS LIST */
@@ -1335,6 +1463,23 @@ select:focus {
     margin: 12px 0;
 }
 
+.train-empty-state {
+    margin: 0;
+    padding: 18px 20px;
+    border: 1px dashed rgba(148, 163, 184, 0.42);
+    border-radius: 12px;
+    color: #dbeafe;
+    background: rgba(15, 23, 42, 0.46);
+    line-height: 1.55;
+}
+
+.train-empty-state strong { display: block; margin-bottom: 5px; color: #f1f5f9; }
+.train-empty-state p { margin: 0 0 6px; }
+.train-empty-state small { color: #a8b8cc; }
+.train-empty-state.is-unavailable { border-style: solid; border-color: rgba(251, 191, 36, 0.42); }
+.train-date-notice { margin-bottom: 14px; border-style: solid; border-color: rgba(251, 191, 36, 0.32); }
+.train-card .price-block { margin-top: 12px; }
+
 .timing-block {
     display: flex;
     flex-direction: column;
@@ -1812,4 +1957,3 @@ footer {
         bottom: 16px;
     }
 }
-
